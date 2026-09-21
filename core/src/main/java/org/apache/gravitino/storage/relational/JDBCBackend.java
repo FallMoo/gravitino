@@ -63,6 +63,7 @@ import org.apache.gravitino.meta.UserEntity;
 import org.apache.gravitino.meta.ViewEntity;
 import org.apache.gravitino.storage.relational.converters.SQLExceptionConverterFactory;
 import org.apache.gravitino.storage.relational.database.H2Database;
+import org.apache.gravitino.storage.relational.service.AgentMetaService;
 import org.apache.gravitino.storage.relational.service.CatalogMetaService;
 import org.apache.gravitino.storage.relational.service.FilesetMetaService;
 import org.apache.gravitino.storage.relational.service.FunctionMetaService;
@@ -144,6 +145,8 @@ public class JDBCBackend implements RelationalBackend {
             ModelVersionMetaService.getInstance().listModelVersionsByNamespace(namespace);
       case FUNCTION:
         return (List<E>) FunctionMetaService.getInstance().listFunctionsByNamespace(namespace);
+      case AGENT:
+        return (List<E>) AgentMetaService.getInstance().listAgentsByNamespace(namespace);
       case POLICY:
         return (List<E>) PolicyMetaService.getInstance().listPoliciesByNamespace(namespace);
       case JOB_TEMPLATE:
@@ -255,6 +258,8 @@ public class JDBCBackend implements RelationalBackend {
         return (E) ModelVersionMetaService.getInstance().updateModelVersion(ident, updater);
       case FUNCTION:
         return (E) FunctionMetaService.getInstance().updateFunction(ident, updater);
+      case AGENT:
+        return (E) AgentMetaService.getInstance().updateAgent(ident, updater);
       case POLICY:
         return (E) PolicyMetaService.getInstance().updatePolicy(ident, updater);
       case JOB_TEMPLATE:
@@ -298,6 +303,8 @@ public class JDBCBackend implements RelationalBackend {
         return (E) ModelVersionMetaService.getInstance().getModelVersionByIdentifier(ident);
       case FUNCTION:
         return (E) FunctionMetaService.getInstance().getFunctionByIdentifier(ident);
+      case AGENT:
+        return (E) AgentMetaService.getInstance().getAgentByIdentifier(ident);
       case POLICY:
         return (E) PolicyMetaService.getInstance().getPolicyByIdentifier(ident);
       case JOB_TEMPLATE:
@@ -419,6 +426,8 @@ public class JDBCBackend implements RelationalBackend {
         return ModelVersionMetaService.getInstance().deleteModelVersion(ident);
       case FUNCTION:
         return FunctionMetaService.getInstance().deleteFunction(ident);
+      case AGENT:
+        return AgentMetaService.getInstance().deleteAgent(ident);
       case POLICY:
         return PolicyMetaService.getInstance().deletePolicy(ident);
       case JOB_TEMPLATE:
@@ -496,6 +505,10 @@ public class JDBCBackend implements RelationalBackend {
         return FunctionMetaService.getInstance()
             .deleteFunctionMetasByLegacyTimeline(
                 legacyTimeline, GARBAGE_COLLECTOR_SINGLE_DELETION_LIMIT);
+      case AGENT:
+        return AgentMetaService.getInstance()
+            .deleteAgentMetasByLegacyTimeline(
+                legacyTimeline, GARBAGE_COLLECTOR_SINGLE_DELETION_LIMIT);
       case TABLE_STATISTIC:
         return StatisticMetaService.getInstance()
             .deleteStatisticsByLegacyTimeline(
@@ -559,6 +572,11 @@ public class JDBCBackend implements RelationalBackend {
         return FunctionMetaService.getInstance()
             .deleteFunctionVersionsByRetentionCount(
                 versionRetentionCount, GARBAGE_COLLECTOR_SINGLE_DELETION_LIMIT);
+      case AGENT:
+        // Agent does not yet implement per-version retention pruning; only the
+        // agent_meta row is purged in collectAndRemoveLegacyData. The version
+        // table is left to follow-up work in Phase 2.
+        return 0;
 
       default:
         throw new IllegalArgumentException(
