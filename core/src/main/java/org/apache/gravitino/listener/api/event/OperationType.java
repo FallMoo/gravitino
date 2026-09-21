@@ -197,6 +197,13 @@ public enum OperationType {
   LIST_FUNCTION,
   LIST_FUNCTION_INFOS,
 
+  // Agent operations
+  REGISTER_AGENT,
+  GET_AGENT,
+  ALTER_AGENT,
+  DROP_AGENT,
+  LIST_AGENT,
+
   AUTHORIZATION_DENIAL,
 
   UNKNOWN,
