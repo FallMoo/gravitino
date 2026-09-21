@@ -82,7 +82,8 @@ public interface Entity extends Serializable {
     JOB_TEMPLATE,
     JOB,
     AUDIT,
-    FUNCTION;
+    FUNCTION,
+    AGENT;
   }
 
   /**
