@@ -521,47 +521,51 @@ EventBus → audit-log 监听器、Lineage、自定义
 > - **Epic** = 1 个（标题 `[EPIC] Gravitino Agent Asset`），作为父 issue；其 `Task list` 字段列出 6 个 Phase 的 PR 编号与每个 Phase 内的 Subtask 编号（参考 `.github/ISSUE_TEMPLATE/epic.yml`）。
 > - **Subtask issue** = 每个 checkbox 1 个（标题 `[Subtask] <简述>`，标签 `subtask`，父 issue 字段填 Epic 编号；模板 `.github/ISSUE_TEMPLATE/subtask.yml`）。
 > - **Commit** = Subtask 级别。一个 Subtask 一个 commit，commit 标题格式 `[Subtask] <标题> (#<subtask-issue>)`；同一 Subtask 内的所有文件改动（含对应单元测试）落在同一 commit，不另起测试 commit。
-> - **PR（Phase PR）** = Phase 边界。Phase 1、Phase 2、Phase 3 各自 1 个 PR（独立可编译、可测、可 squash merge）；Phase 4 客户端拆 1–2 个 PR（Java 客户端必选，Python / CLI 可合并）；Phase 5（文档与测试）与 Phase 6（发布）合并为 1 个 PR。总计 **4–6 个 PR**。
+> - **PR（Phase PR）** = Phase 边界。Phase 1、Phase 2、Phase 3、Phase 4 各自 1 个 PR（独立可编译、可测、可 squash merge）；Phase 5 + Phase 6 合并为 1 个 PR（纯文档 + 发布流程）。**总计 5–6 个 PR**。
+> - **测试前置**：每个 Phase 的单元测试在**该 Phase 内**完成，**不**延后到 Phase 5。Phase 5 只负责 OpenAPI / 用户文档 / 集成测试 / 发布。**测试滞后会导致 bug 漏过 phase 边界**（真实教训：Phase 1 #9 AgentMetaService 没单测，潜伏了 4 个 bug 到 Phase 5 阶段才被 test 触发修——`AgentProtocol` 反序列化接口失败、`deleteAgent` 缺 NotFound catch、`applyChanges` 私有无法复用、`NameIdentifierUtil.toMetadataObject` 不识 AGENT）。
 > - 拆分原则：每个 Phase PR 必须是"自包含"——能 `./gradlew compileJava test -PskipITs` 通过；不允许 Phase 1 PR 引用 Phase 2 才出现的新类。
 
 ### Phase 1：核心 API 与存储
+
+> **Phase 1 验收标准**：除脚本 / DTO / 权限映射这几类纯数据类外，**所有核心类（AgentEntity / AgentPO / AgentPOAgentMetaMapper / AgentMetaService 等）必须在同一 Phase 落地时附带单元测试**，没有测试 = 该 Subtask 不算完成。Phase 1 PR 不接受"Subtask 落地、测试留 Phase 5"的状态。
 
 - [ ] 在 `MetadataObject.Type` 枚举加入 `AGENT`，在 `Entity.EntityType` 枚举加入 `AGENT`，并在 `api/MetadataObjects.java` 的 `parent()` switch 加 `case AGENT`（与 `FUNCTION` 共用 SCHEMA 父节点），同时把 `AGENT` 加入 `VALID_THREE_LEVEL_NAME_TYPES` 集合
 - [ ] 在 `api/src/main/java/org/apache/gravitino/agent/` 定义 `Agent`、`AgentProtocol`、`AgentChange`（含 `RenameAgent` / `SetProperty` / `RemoveProperty` / `AddProtocol` / `RemoveProtocol` / `AddCapability` / `RemoveCapability` / `UpdateComment` / `SetOwner` 9 个嵌套 final class 与对应静态工厂方法），参照 `FunctionChange.java`
 - [ ] 在 `api/agent/` 定义 `AgentCatalog` 能力接口（含 `default agentExists`）；参照 `FunctionCatalog.java`
 - [ ] 在 `api/exceptions/` 新增 `AgentAlreadyExistsException` 与 `NoSuchAgentException`，参照 `FunctionAlreadyExistsException` / `NoSuchFunctionException`
-- [ ] 在 `core/src/main/java/org/apache/gravitino/meta/` 实现 `AgentEntity`（实现 `Entity`、`Auditable`、`Agent`；`HasIdentifier` 通过 `Entity` 接口的 identifier 字段满足；`SupportsTags/Policies/Roles` 由 `Agent` 接口的 default 方法实现）
+- [ ] 在 `core/src/main/java/org/apache/gravitino/meta/` 实现 `AgentEntity`（实现 `Entity`、`Auditable`、`Agent`；`HasIdentifier` 通过 `Entity` 接口的 identifier 字段满足；`SupportsTags/Policies/Roles` 由 `Agent` 接口的 default 方法实现）**+ 配套 `TestAgentEntity` 单测**
 - [ ] 在 `core/src/main/java/org/apache/gravitino/storage/relational/po/` 定义 `AgentPO` 与 `AgentVersionPO`
 - [ ] 在 `core/src/main/java/org/apache/gravitino/storage/relational/mapper/` 定义 `AgentMetaMapper`、`AgentVersionMetaMapper` 接口与 `AgentMetaSQLProviderFactory`（含 H2/MySQL/PostgreSQL 三个 dialect provider），参照 `FunctionMetaSQLProviderFactory` 的三 provider 结构
 - [ ] 在 `MapperHelpers` 注册新 mapper，在 `JdbcDatabase` 注册 JDBC config
-- [ ] 实现 `AgentMetaService` 处理 PO ↔ Entity 转换（参照 `FunctionMetaService`，含软删除与版本写入）
+- [ ] 实现 `AgentMetaService` 处理 PO ↔ Entity 转换（参照 `FunctionMetaService`，含软删除与版本写入）**+ 配套 `TestAgentMetaService` 单测**（覆盖 insert / list / get / delete / alter 五条主要路径 + 协议 type 唯一性校验 + rename+setOwner 组合）
 - [ ] 在 `scripts/{h2,mysql,postgresql}/schema-1.3.0-*.sql` 末尾追加 `agent_meta` + `agent_version_info` 的 `CREATE TABLE`（参考 `function_meta` 段；H2/MySQL 用反引号 + ENGINE=InnoDB，PostgreSQL 用双引号 + `COMMENT ON` + 独立 `CREATE INDEX`）
 - [ ] 在 `common/src/main/java/org/apache/gravitino/dto/agent/` 增加 `AgentDTO`、`AgentProtocolDTO`、`AgentRegisterRequest`、`AgentRegisterResponse`、`AgentListResponse`、`AgentResponse`、`AgentUpdatesRequest`，以及对应的 `ErrorConstants` 错误码
 - [ ] 在 `DTOConverters` 增加 `toAgentDTO(...)`、`toAgentProtocolDTO(...)`、`fromAgentRequest(...)`、`fromAgentProtocolRequest(...)`
 - [ ] 在 `api/authorization/Privileges.java` 增加 `REGISTER_AGENT` / `EXECUTE_AGENT` / `MODIFY_AGENT` 三个 `Privilege.Name` 与 `RegisterAgent.allow()` / `ExecuteAgent.allow()` / `ModifyAgent.allow()` final class；同时新增 `AGENT_SUPPORTED_TYPES` 并加入 `MANAGE_GRANTS_SUPPORTED_TYPES`
 - [ ] 更新 jcasbin GRule 模型（`server-common/src/main/resources/jcasbin/*.conf`）：参照 Function 的 `g_function` / `p_function` 规则新增 `g_agent` / `p_agent` 规则；并在 metalake 默认 policy 中补 AGENT 相关项
 - [ ] 在 `core/src/main/java/org/apache/gravitino/utils/MetadataObjectUtil.java` 增加 `MetadataObject.Type.AGENT → Entity.EntityType.AGENT` 映射
-- [ ] 为 `AgentEntity`、`AgentPO`、`AgentMetaService`、权限映射、jcasbin 规则补充单元测试
 
 ### Phase 2：Dispatcher 链
+
+> **Phase 2 验收标准**：每个 dispatcher 与 hook 类必须配套 mock-based 单测（沿用 `TestFunctionHookDispatcher` 的模式），验证 Pre / Success / Failure 事件序列 + owner 设置 + 异常透传。无测试 = Subtask 不算完成。
 
 - [x] 在 `core/src/main/java/org/apache/gravitino/catalog/` 定义 `AgentDispatcher` 接口（参照 `FunctionDispatcher`，是空接口仅 extends `AgentCatalog`）
 - [ ] 实现 `AgentOperationDispatcher`（TreeLock、命名空间校验、jcasbin 调用、业务逻辑），参照 `FunctionDispatcher` 实现
 - [ ] 实现 `AgentNormalizeDispatcher`（入参规范化、默认值），规范化规则：`properties == null → empty map`、`capabilities/protocols == null → []`、`endpoint` 不 trim trailing slash
-- [ ] 实现 `AgentHookDispatcher`（纯委派，为未来 hook 留口），参照 `FunctionHookDispatcher`
-- [ ] 实现 `AgentEventDispatcher`（PreEvent / PostEvent / FailureEvent），参照 `FunctionEventDispatcher`
+- [ ] 实现 `AgentHookDispatcher`（纯委派，为未来 hook 留口）+ 配套 `TestAgentHookDispatcher` 单测（验证 registerAgent → setOwner 序列）
+- [ ] 实现 `AgentEventDispatcher`（PreEvent / PostEvent / FailureEvent）+ 配套 `TestAgentEventDispatcher` 单测（mock `EventBus`，验证 register / alter / drop / get / list 都正确发 Pre + 成功 + Failure 三事件，agentExists 不发任何事件）
 - [ ] 在 `core/src/main/java/org/apache/gravitino/listener/api/event/agent/` 定义 21 个事件类（命名空间 `org.apache.gravitino.listener.api.event.agent.*`，与 `function.*` / `model.*` 并列）—— 实际事件清单按 Function 1:1 镜像：`RegisterAgentEvent` / `RegisterAgentPreEvent` / `RegisterAgentFailureEvent` + `AlterAgentEvent` / `AlterAgentPreEvent` / `AlterAgentFailureEvent` + `DropAgentEvent` / `DropAgentPreEvent` / `DropAgentFailureEvent` + `GetAgentEvent` / `GetAgentPreEvent` / `GetAgentFailureEvent` + `ListAgentsEvent` / `ListAgentsPreEvent` / `ListAgentsFailureEvent` + `AgentExistsEvent` / `AgentExistsPreEvent` + 顶层基类 `AgentEvent` / `AgentPreEvent` / `AgentFailureEvent` + `AgentInfoEvent`（Function 同样有此中间基类）。任务清单原列的 `AgentFailureEvent` 已在顶层基类覆盖。
 - [x] 在 `core/src/main/java/org/apache/gravitino/catalog/` 实现 `ManagedAgentOperations`，对接 `AgentCatalog` 接口（Phase 2 Subtask A 落地：commit `68b7d7469`）
 - [ ] 把 `AgentDispatcher` 装配进 `GravitinoEnv` 初始化流程
-- [ ] 为 dispatcher 链补单元测试（规范化、hook、事件发布）
 
 ### Phase 3：REST API
 
-- [ ] 在 `server/src/main/java/org/apache/gravitino/server/web/rest/` 实现 `AgentOperations` JAX-RS 资源（路径前缀 `metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/agents`），参照 `FunctionOperations.java` 的注解组合与鉴权表达式
+> **Phase 3 验收标准**：`AgentOperations` JAX-RS 资源必须配套 `TestAgentOperations` 单测（参考 `TestFunctionOperations`），覆盖路径 / 请求体 / 状态码 / 鉴权失败路径。无测试 = Subtask 不算完成。
+
+- [ ] 在 `server/src/main/java/org/apache/gravitino/server/web/rest/` 实现 `AgentOperations` JAX-RS 资源（路径前缀 `metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/agents`），参照 `FunctionOperations.java` 的注解组合与鉴权表达式 + 配套 `TestAgentOperations` 单测
 - [ ] 在 Jersey 资源绑定里注册 `AgentOperations`（参照 `Binder` 类对 `FunctionOperations` 的注册方式）
-- [ ] 在 `server/src/main/java/org/apache/gravitino/server/web/ExceptionHandlers.java` 增加 `handleAgentException(...)`，参照 `handleFunctionException`
+- [ ] 在 `server/src/main/java/org/apache/gravitino/server/web/ExceptionHandlers.java` 增加 `handleAgentException(...)`，参照 `handleFunctionException` + 配套单测
 - [ ] 验证 `MetadataObjectTagOperations` / `MetadataObjectPolicyOperations` 对 `AGENT` 类型的端到端支持
-- [ ] 为 REST 资源补单元测试（请求 / 响应结构、状态码、鉴权集成）
 
 ### Phase 4：客户端
 
@@ -569,7 +573,9 @@ EventBus → audit-log 监听器、Lineage、自定义
 - [ ] 在 `clients/client-python/` 增加 Python 客户端支持（pydantic 模型、同步 / 异步方法），与 Function 客户端保持结构一致
 - [ ] 视情况在 `clients/cli/` 加 CLI 支持（`gravitino agent list/register/alter/delete`），复用 Function CLI 子命令骨架
 
-### Phase 5：文档与测试
+### Phase 5：文档、集成测试与发布
+
+> **Phase 5 范围已缩小**：Phase 1 / 2 / 3 / 4 内**各自的单元测试已经在落地时完成**。Phase 5 只做：OpenAPI 规范 + 用户文档 + 跨模块集成测试 + 发布流程。**不**在 Phase 5 补 Phase 1/2/3 的单测——那是 Phase 1/2/3 各自的 acceptance。
 
 - [ ] 在 `docs/open-api/agents.yaml` 写 OpenAPI 规范（与 Function 的 `functions.yaml` 并列）
 - [ ] 用 `./gradlew :docs:build` 校验
@@ -604,3 +610,4 @@ EventBus → audit-log 监听器、Lineage、自定义
 - [x] Role 绑定范围：v1 不实现 Agent 级 `grantRole` / `revokeRole` dispatcher，`SupportsRoles` 仅作 mixin 占位（见 §3 非目标 #8、§5.6 鉴权集成）
 - [x] `agent_card_url` 是不透明可选字段，v1 不抓取、不解析（见 §3 非目标 #11、§5.1 AgentProtocol 表）
 - [x] `capabilities` 的 `null` 与空数组等价，统一落库为 `[]`（见 §3 非目标 #10、§5.1 Agent 表）
+- [x] **测试前置**：Phase 1/2/3/4 的单元测试在所属 Phase 完成，**不**延后到 Phase 5。Phase 5 只做集成测试 / OpenAPI / 用户文档 / 发布流程（见 §6 粒度约定）
