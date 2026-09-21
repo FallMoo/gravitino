@@ -1086,3 +1086,67 @@ COMMENT ON COLUMN iceberg_cleanup_job.last_error IS 'truncated reason for the mo
 COMMENT ON COLUMN iceberg_cleanup_job.heartbeat_at IS 'last heartbeat from the worker, 0 when not running';
 COMMENT ON COLUMN iceberg_cleanup_job.created_by IS 'principal that requested the drop (audit)';
 COMMENT ON COLUMN iceberg_cleanup_job.updated_at IS 'last state change, drives poll ordering and old finished-job cleanup';
+
+CREATE TABLE IF NOT EXISTS agent_meta (
+    agent_id BIGINT NOT NULL,
+    agent_name VARCHAR(128) NOT NULL,
+    metalake_id BIGINT NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    schema_id BIGINT NOT NULL,
+    endpoint VARCHAR(1024) NOT NULL,
+    capabilities TEXT DEFAULT NULL,
+    protocols TEXT DEFAULT NULL,
+    owner VARCHAR(128) NOT NULL,
+    agent_current_version INT DEFAULT 1,
+    agent_latest_version INT DEFAULT 1,
+    audit_info TEXT NOT NULL,
+    deleted_at BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_id),
+    UNIQUE (schema_id, agent_name, deleted_at)
+);
+CREATE INDEX idx_agent_meta_metalake_id ON agent_meta (metalake_id);
+CREATE INDEX idx_agent_meta_catalog_id ON agent_meta (catalog_id);
+
+COMMENT ON TABLE agent_meta IS 'agent metadata';
+COMMENT ON COLUMN agent_meta.agent_id IS 'agent id';
+COMMENT ON COLUMN agent_meta.agent_name IS 'agent name';
+COMMENT ON COLUMN agent_meta.metalake_id IS 'metalake id';
+COMMENT ON COLUMN agent_meta.catalog_id IS 'catalog id';
+COMMENT ON COLUMN agent_meta.schema_id IS 'schema id';
+COMMENT ON COLUMN agent_meta.endpoint IS 'agent endpoint URL (opaque string)';
+COMMENT ON COLUMN agent_meta.capabilities IS 'JSON array of capability tags';
+COMMENT ON COLUMN agent_meta.protocols IS 'JSON array of protocol descriptors';
+COMMENT ON COLUMN agent_meta.owner IS 'logical owner of the agent';
+COMMENT ON COLUMN agent_meta.agent_current_version IS 'agent current version';
+COMMENT ON COLUMN agent_meta.agent_latest_version IS 'agent latest version';
+COMMENT ON COLUMN agent_meta.audit_info IS 'agent audit info';
+COMMENT ON COLUMN agent_meta.deleted_at IS 'agent deleted at';
+
+CREATE TABLE IF NOT EXISTS agent_version_info (
+    id BIGSERIAL PRIMARY KEY,
+    metalake_id BIGINT NOT NULL,
+    catalog_id BIGINT NOT NULL,
+    schema_id BIGINT NOT NULL,
+    agent_id BIGINT NOT NULL,
+    version INT NOT NULL,
+    agent_comment TEXT DEFAULT NULL,
+    agent_properties TEXT DEFAULT NULL,
+    audit_info TEXT NOT NULL,
+    deleted_at BIGINT NOT NULL DEFAULT 0,
+    UNIQUE (agent_id, version, deleted_at)
+);
+CREATE INDEX idx_agent_version_info_metalake_id ON agent_version_info (metalake_id);
+CREATE INDEX idx_agent_version_info_catalog_id ON agent_version_info (catalog_id);
+CREATE INDEX idx_agent_version_info_schema_id ON agent_version_info (schema_id);
+
+COMMENT ON TABLE agent_version_info IS 'agent version info';
+COMMENT ON COLUMN agent_version_info.id IS 'auto increment id';
+COMMENT ON COLUMN agent_version_info.metalake_id IS 'metalake id';
+COMMENT ON COLUMN agent_version_info.catalog_id IS 'catalog id';
+COMMENT ON COLUMN agent_version_info.schema_id IS 'schema id';
+COMMENT ON COLUMN agent_version_info.agent_id IS 'agent id';
+COMMENT ON COLUMN agent_version_info.version IS 'agent version';
+COMMENT ON COLUMN agent_version_info.agent_comment IS 'agent version comment';
+COMMENT ON COLUMN agent_version_info.agent_properties IS 'JSON object of agent properties at this version';
+COMMENT ON COLUMN agent_version_info.audit_info IS 'agent version audit info';
+COMMENT ON COLUMN agent_version_info.deleted_at IS 'agent version deleted at';

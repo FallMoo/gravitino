@@ -631,3 +631,40 @@ CREATE TABLE IF NOT EXISTS `iceberg_cleanup_job` (
 ) COMMENT='async Iceberg table cleanup jobs';
 CREATE INDEX IF NOT EXISTS `idx_state_updated` ON `iceberg_cleanup_job` (`state`, `updated_at`);
 CREATE INDEX IF NOT EXISTS `idx_object` ON `iceberg_cleanup_job` (`catalog_id`, `namespace`, `table_name`, `state`);
+
+CREATE TABLE IF NOT EXISTS `agent_meta` (
+    `agent_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'agent id',
+    `agent_name` VARCHAR(128) NOT NULL COMMENT 'agent name',
+    `metalake_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'metalake id',
+    `catalog_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'catalog id',
+    `schema_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'schema id',
+    `endpoint` VARCHAR(1024) NOT NULL COMMENT 'agent endpoint URL (opaque string)',
+    `capabilities` CLOB DEFAULT NULL COMMENT 'JSON array of capability tags',
+    `protocols` CLOB DEFAULT NULL COMMENT 'JSON array of protocol descriptors',
+    `owner` VARCHAR(128) NOT NULL COMMENT 'logical owner of the agent',
+    `agent_current_version` INT UNSIGNED DEFAULT 1 COMMENT 'agent current version',
+    `agent_latest_version` INT UNSIGNED DEFAULT 1 COMMENT 'agent latest version',
+    `audit_info` CLOB NOT NULL COMMENT 'agent audit info',
+    `deleted_at` BIGINT(20) UNSIGNED NOT NULL DEFAULT 0 COMMENT 'agent deleted at',
+    PRIMARY KEY (`agent_id`),
+    UNIQUE KEY `uk_sid_agn_del` (`schema_id`, `agent_name`, `deleted_at`),
+    KEY `idx_agnmid` (`metalake_id`),
+    KEY `idx_agncid` (`catalog_id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS `agent_version_info` (
+    `id` BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'auto increment id',
+    `metalake_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'metalake id',
+    `catalog_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'catalog id',
+    `schema_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'schema id',
+    `agent_id` BIGINT(20) UNSIGNED NOT NULL COMMENT 'agent id',
+    `version` INT UNSIGNED NOT NULL COMMENT 'agent version',
+    `agent_comment` CLOB DEFAULT NULL COMMENT 'agent version comment',
+    `agent_properties` CLOB DEFAULT NULL COMMENT 'JSON object of agent properties at this version',
+    `audit_info` CLOB NOT NULL COMMENT 'agent version audit info',
+    `deleted_at` BIGINT(20) UNSIGNED NOT NULL DEFAULT 0 COMMENT 'agent version deleted at',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_avi_agent_version` (`agent_id`, `version`, `deleted_at`),
+    KEY `idx_avimid` (`metalake_id`),
+    KEY `idx_avicid` (`catalog_id`)
+) ENGINE=InnoDB;
