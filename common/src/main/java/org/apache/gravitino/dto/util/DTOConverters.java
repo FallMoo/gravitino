@@ -29,6 +29,8 @@ import org.apache.gravitino.Catalog;
 import org.apache.gravitino.MetadataObject;
 import org.apache.gravitino.Metalake;
 import org.apache.gravitino.Schema;
+import org.apache.gravitino.agent.Agent;
+import org.apache.gravitino.agent.AgentProtocol;
 import org.apache.gravitino.authorization.Group;
 import org.apache.gravitino.authorization.Owner;
 import org.apache.gravitino.authorization.Privilege;
@@ -42,6 +44,8 @@ import org.apache.gravitino.dto.AuditDTO;
 import org.apache.gravitino.dto.CatalogDTO;
 import org.apache.gravitino.dto.MetalakeDTO;
 import org.apache.gravitino.dto.SchemaDTO;
+import org.apache.gravitino.dto.agent.AgentDTO;
+import org.apache.gravitino.dto.agent.AgentProtocolDTO;
 import org.apache.gravitino.dto.authorization.GroupDTO;
 import org.apache.gravitino.dto.authorization.OwnerDTO;
 import org.apache.gravitino.dto.authorization.PrivilegeDTO;
@@ -837,6 +841,46 @@ public class DTOConverters {
         .withComment(function.comment())
         .withDefinitions(definitionDTOs)
         .withAudit(toDTO(function.auditInfo()))
+        .build();
+  }
+
+  /**
+   * Converts an {@link AgentProtocol} to its DTO representation.
+   *
+   * @param protocol The agent protocol to convert.
+   * @return The {@link AgentProtocolDTO}.
+   */
+  public static AgentProtocolDTO toDTO(AgentProtocol protocol) {
+    return AgentProtocolDTO.builder()
+        .withType(protocol.type())
+        .withAgentCardUrl(protocol.agentCardUrl())
+        .withProperties(protocol.properties())
+        .build();
+  }
+
+  /**
+   * Converts an {@link Agent} to its DTO representation.
+   *
+   * @param agent The agent to convert.
+   * @return The {@link AgentDTO}.
+   */
+  public static AgentDTO toDTO(Agent agent) {
+    AgentProtocolDTO[] protocolDTOs = null;
+    if (agent.protocols() != null) {
+      protocolDTOs =
+          Arrays.stream(agent.protocols())
+              .map(DTOConverters::toDTO)
+              .toArray(AgentProtocolDTO[]::new);
+    }
+    return AgentDTO.builder()
+        .withName(agent.name())
+        .withEndpoint(agent.endpoint())
+        .withCapabilities(agent.capabilities())
+        .withProtocols(protocolDTOs)
+        .withOwner(agent.owner())
+        .withComment(agent.comment())
+        .withProperties(agent.properties())
+        .withAudit(toDTO(agent.auditInfo()))
         .build();
   }
 
