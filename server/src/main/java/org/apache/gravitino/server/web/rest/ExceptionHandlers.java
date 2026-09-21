@@ -22,6 +22,7 @@ import com.google.common.annotations.VisibleForTesting;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 import org.apache.gravitino.dto.responses.ErrorResponse;
+import org.apache.gravitino.exceptions.AgentAlreadyExistsException;
 import org.apache.gravitino.exceptions.AlreadyExistsException;
 import org.apache.gravitino.exceptions.CatalogAlreadyExistsException;
 import org.apache.gravitino.exceptions.ConnectionFailedException;
@@ -152,6 +153,11 @@ public class ExceptionHandlers {
   public static Response handleFunctionException(
       OperationType op, String function, String schema, Exception e) {
     return FunctionExceptionHandler.INSTANCE.handle(op, function, schema, e);
+  }
+
+  public static Response handleAgentException(
+      OperationType op, String agent, String schema, Exception e) {
+    return AgentExceptionHandler.INSTANCE.handle(op, agent, schema, e);
   }
 
   public static Response handleJobTemplateException(
@@ -929,6 +935,43 @@ public class ExceptionHandlers {
 
       } else {
         return super.handle(op, function, schema, e);
+      }
+    }
+  }
+
+  private static class AgentExceptionHandler extends BaseExceptionHandler {
+    private static final ExceptionHandler INSTANCE = new AgentExceptionHandler();
+
+    private static String getAgentErrorMsg(
+        String agent, String operation, String schema, String reason) {
+      return String.format(
+          "Failed to operate agent(s)%s operation [%s] under schema [%s], reason [%s]",
+          agent, operation, schema, reason);
+    }
+
+    @Override
+    public Response handle(OperationType op, String agent, String schema, Exception e) {
+      String formatted = StringUtil.isBlank(agent) ? "" : " [" + agent + "]";
+      String errorMsg = getAgentErrorMsg(formatted, op.name(), schema, getErrorMsg(e));
+      LOG.warn(errorMsg, e);
+
+      if (e instanceof IllegalArgumentException) {
+        return Utils.illegalArguments(errorMsg, e);
+
+      } else if (e instanceof NotFoundException) {
+        return Utils.notFound(errorMsg, e);
+
+      } else if (e instanceof AgentAlreadyExistsException) {
+        return Utils.alreadyExists(errorMsg, e);
+
+      } else if (e instanceof ForbiddenException) {
+        return Utils.forbidden(errorMsg, e);
+
+      } else if (e instanceof NotInUseException) {
+        return Utils.notInUse(errorMsg, e);
+
+      } else {
+        return super.handle(op, agent, schema, e);
       }
     }
   }
