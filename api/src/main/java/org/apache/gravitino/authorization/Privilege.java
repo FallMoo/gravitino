@@ -151,7 +151,13 @@ public interface Privilege {
     /** The privilege to execute (invoke) a function. */
     EXECUTE_FUNCTION(0L, 1L << 31),
     /** The privilege to alter a function's metadata. */
-    MODIFY_FUNCTION(0L, 1L << 32);
+    MODIFY_FUNCTION(0L, 1L << 32),
+    /** The privilege to register an agent. */
+    REGISTER_AGENT(0L, 1L << 33),
+    /** The privilege to execute (invoke) an agent. */
+    EXECUTE_AGENT(0L, 1L << 34),
+    /** The privilege to alter an agent's metadata. */
+    MODIFY_AGENT(0L, 1L << 35);
 
     private final long highBits;
     private final long lowBits;

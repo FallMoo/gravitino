@@ -71,6 +71,13 @@ public class Privileges {
           MetadataObject.Type.SCHEMA,
           MetadataObject.Type.FUNCTION);
 
+  private static final Set<MetadataObject.Type> AGENT_SUPPORTED_TYPES =
+      Sets.immutableEnumSet(
+          MetadataObject.Type.METALAKE,
+          MetadataObject.Type.CATALOG,
+          MetadataObject.Type.SCHEMA,
+          MetadataObject.Type.AGENT);
+
   /**
    * Object types that {@link ManageGrants} can be bound to.
    *
@@ -87,7 +94,8 @@ public class Privileges {
           MetadataObject.Type.TOPIC,
           MetadataObject.Type.FILESET,
           MetadataObject.Type.MODEL,
-          MetadataObject.Type.FUNCTION);
+          MetadataObject.Type.FUNCTION,
+          MetadataObject.Type.AGENT);
 
   /**
    * Returns the Privilege with allow condition from the string representation.
@@ -205,6 +213,14 @@ public class Privileges {
         return ExecuteFunction.allow();
       case MODIFY_FUNCTION:
         return ModifyFunction.allow();
+
+        // Agent
+      case REGISTER_AGENT:
+        return RegisterAgent.allow();
+      case EXECUTE_AGENT:
+        return ExecuteAgent.allow();
+      case MODIFY_AGENT:
+        return ModifyAgent.allow();
 
       default:
         throw new IllegalArgumentException("Doesn't support the privilege: " + name);
@@ -327,6 +343,12 @@ public class Privileges {
         return ExecuteFunction.deny();
       case MODIFY_FUNCTION:
         return ModifyFunction.deny();
+      case REGISTER_AGENT:
+        return RegisterAgent.deny();
+      case EXECUTE_AGENT:
+        return ExecuteAgent.deny();
+      case MODIFY_AGENT:
+        return ModifyAgent.deny();
 
       default:
         throw new IllegalArgumentException("Doesn't support the privilege: " + name);
@@ -1458,6 +1480,99 @@ public class Privileges {
     @Override
     public boolean canBindTo(MetadataObject.Type type) {
       return FUNCTION_SUPPORTED_TYPES.contains(type);
+    }
+  }
+
+  /** The privilege to register an agent. */
+  public static class RegisterAgent extends GenericPrivilege<RegisterAgent> {
+    private static final RegisterAgent ALLOW_INSTANCE =
+        new RegisterAgent(Condition.ALLOW, Name.REGISTER_AGENT);
+    private static final RegisterAgent DENY_INSTANCE =
+        new RegisterAgent(Condition.DENY, Name.REGISTER_AGENT);
+
+    private RegisterAgent(Condition condition, Name name) {
+      super(condition, name);
+    }
+
+    /**
+     * @return The instance with allow condition of the privilege.
+     */
+    public static RegisterAgent allow() {
+      return ALLOW_INSTANCE;
+    }
+
+    /**
+     * @return The instance with deny condition of the privilege.
+     */
+    public static RegisterAgent deny() {
+      return DENY_INSTANCE;
+    }
+
+    @Override
+    public boolean canBindTo(MetadataObject.Type type) {
+      return AGENT_SUPPORTED_TYPES.contains(type);
+    }
+  }
+
+  /** The privilege to execute (invoke) an agent. */
+  public static class ExecuteAgent extends GenericPrivilege<ExecuteAgent> {
+    private static final ExecuteAgent ALLOW_INSTANCE =
+        new ExecuteAgent(Condition.ALLOW, Name.EXECUTE_AGENT);
+    private static final ExecuteAgent DENY_INSTANCE =
+        new ExecuteAgent(Condition.DENY, Name.EXECUTE_AGENT);
+
+    private ExecuteAgent(Condition condition, Name name) {
+      super(condition, name);
+    }
+
+    /**
+     * @return The instance with allow condition of the privilege.
+     */
+    public static ExecuteAgent allow() {
+      return ALLOW_INSTANCE;
+    }
+
+    /**
+     * @return The instance with deny condition of the privilege.
+     */
+    public static ExecuteAgent deny() {
+      return DENY_INSTANCE;
+    }
+
+    @Override
+    public boolean canBindTo(MetadataObject.Type type) {
+      return AGENT_SUPPORTED_TYPES.contains(type);
+    }
+  }
+
+  /** The privilege to alter an agent's metadata. */
+  public static class ModifyAgent extends GenericPrivilege<ModifyAgent> {
+    private static final ModifyAgent ALLOW_INSTANCE =
+        new ModifyAgent(Condition.ALLOW, Name.MODIFY_AGENT);
+    private static final ModifyAgent DENY_INSTANCE =
+        new ModifyAgent(Condition.DENY, Name.MODIFY_AGENT);
+
+    private ModifyAgent(Condition condition, Name name) {
+      super(condition, name);
+    }
+
+    /**
+     * @return The instance with allow condition of the privilege.
+     */
+    public static ModifyAgent allow() {
+      return ALLOW_INSTANCE;
+    }
+
+    /**
+     * @return The instance with deny condition of the privilege.
+     */
+    public static ModifyAgent deny() {
+      return DENY_INSTANCE;
+    }
+
+    @Override
+    public boolean canBindTo(MetadataObject.Type type) {
+      return AGENT_SUPPORTED_TYPES.contains(type);
     }
   }
 }
