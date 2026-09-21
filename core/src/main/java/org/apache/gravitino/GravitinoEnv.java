@@ -28,6 +28,9 @@ import org.apache.gravitino.authorization.OwnerDispatcher;
 import org.apache.gravitino.authorization.OwnerEventManager;
 import org.apache.gravitino.authorization.OwnerManager;
 import org.apache.gravitino.auxiliary.AuxiliaryServiceManager;
+import org.apache.gravitino.catalog.AgentDispatcher;
+import org.apache.gravitino.catalog.AgentNormalizeDispatcher;
+import org.apache.gravitino.catalog.AgentOperationDispatcher;
 import org.apache.gravitino.catalog.CatalogDispatcher;
 import org.apache.gravitino.catalog.CatalogManager;
 import org.apache.gravitino.catalog.CatalogNormalizeDispatcher;
@@ -57,6 +60,7 @@ import org.apache.gravitino.catalog.ViewNormalizeDispatcher;
 import org.apache.gravitino.catalog.ViewOperationDispatcher;
 import org.apache.gravitino.credential.CredentialOperationDispatcher;
 import org.apache.gravitino.hook.AccessControlHookDispatcher;
+import org.apache.gravitino.hook.AgentHookDispatcher;
 import org.apache.gravitino.hook.CatalogHookDispatcher;
 import org.apache.gravitino.hook.FilesetHookDispatcher;
 import org.apache.gravitino.hook.FunctionHookDispatcher;
@@ -73,6 +77,7 @@ import org.apache.gravitino.job.JobManager;
 import org.apache.gravitino.job.JobOperationDispatcher;
 import org.apache.gravitino.job.JobTemplateValidationDispatcher;
 import org.apache.gravitino.listener.AccessControlEventDispatcher;
+import org.apache.gravitino.listener.AgentEventDispatcher;
 import org.apache.gravitino.listener.CatalogEventDispatcher;
 import org.apache.gravitino.listener.EventBus;
 import org.apache.gravitino.listener.EventListenerManager;
@@ -146,6 +151,8 @@ public class GravitinoEnv {
   private ModelDispatcher modelDispatcher;
 
   private FunctionDispatcher functionDispatcher;
+
+  private AgentDispatcher agentDispatcher;
 
   private ViewDispatcher viewDispatcher;
   private ViewDispatcher internalViewDispatcher;
@@ -327,6 +334,15 @@ public class GravitinoEnv {
    */
   public FunctionDispatcher functionDispatcher() {
     return functionDispatcher;
+  }
+
+  /**
+   * Get the AgentDispatcher associated with the Gravitino environment.
+   *
+   * @return The AgentDispatcher instance.
+   */
+  public AgentDispatcher agentDispatcher() {
+    return agentDispatcher;
   }
 
   /**
@@ -758,6 +774,18 @@ public class GravitinoEnv {
     FunctionEventDispatcher functionEventDispatcher =
         new FunctionEventDispatcher(eventBus, functionNormalizeDispatcher);
     this.functionDispatcher = new FunctionHookDispatcher(functionEventDispatcher);
+
+    // Create and initialize Agent related modules, the operation chain is:
+    // AgentHookDispatcher -> AgentEventDispatcher -> AgentNormalizeDispatcher ->
+    // AgentOperationDispatcher. Same shape as Function.
+    AgentOperationDispatcher agentOperationDispatcher =
+        new AgentOperationDispatcher(
+            catalogManager, schemaOperationDispatcher, entityStore, idGenerator);
+    AgentNormalizeDispatcher agentNormalizeDispatcher =
+        new AgentNormalizeDispatcher(agentOperationDispatcher, catalogManager);
+    AgentEventDispatcher agentEventDispatcher =
+        new AgentEventDispatcher(eventBus, agentNormalizeDispatcher);
+    this.agentDispatcher = new AgentHookDispatcher(agentEventDispatcher);
 
     // View operation chain: ViewEventDispatcher -> ViewNormalizeDispatcher ->
     // ViewOperationDispatcher.
