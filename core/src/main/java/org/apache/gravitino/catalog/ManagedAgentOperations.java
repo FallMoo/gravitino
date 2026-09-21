@@ -188,8 +188,11 @@ public class ManagedAgentOperations implements AgentCatalog {
   /**
    * Apply an ordered list of {@link AgentChange}s to the existing entity and return a new entity.
    * The change set is closed: unknown change types raise {@link IllegalArgumentException}.
+   *
+   * <p>Public static so tests and other dispatchers can reuse the same change-application logic
+   * without instantiating a {@link ManagedAgentOperations}.
    */
-  private AgentEntity applyChanges(AgentEntity oldEntity, AgentChange... changes) {
+  public static AgentEntity applyChanges(AgentEntity oldEntity, AgentChange... changes) {
     String newName = oldEntity.name();
     String newComment = oldEntity.comment();
     String newEndpoint = oldEntity.endpoint();

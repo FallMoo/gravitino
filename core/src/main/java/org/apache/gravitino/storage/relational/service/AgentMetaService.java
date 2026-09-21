@@ -34,6 +34,7 @@ import org.apache.gravitino.MetadataObject;
 import org.apache.gravitino.NameIdentifier;
 import org.apache.gravitino.Namespace;
 import org.apache.gravitino.agent.AgentProtocol;
+import org.apache.gravitino.dto.agent.AgentProtocolDTO;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.json.JsonUtils;
 import org.apache.gravitino.meta.AgentEntity;
@@ -115,7 +116,12 @@ public class AgentMetaService {
   }
 
   public boolean deleteAgent(NameIdentifier ident) {
-    AgentPO agentPO = getAgentPOByIdentifier(ident);
+    AgentPO agentPO;
+    try {
+      agentPO = getAgentPOByIdentifier(ident);
+    } catch (NoSuchEntityException e) {
+      return false;
+    }
     Long agentId = agentPO.agentId();
 
     AtomicInteger agentDeletedCount = new AtomicInteger();
@@ -167,8 +173,7 @@ public class AgentMetaService {
                   AgentMetaMapper.class, mapper -> mapper.updateAgentMeta(newAgentPO, oldAgentPO)));
       return newEntity;
     } catch (RuntimeException re) {
-      ExceptionUtils.checkSQLException(
-          re, Entity.EntityType.AGENT, newEntity.nameIdentifier().toString());
+      ExceptionUtils.checkSQLException(re, Entity.EntityType.AGENT, identifier.toString());
       throw re;
     }
   }
@@ -236,7 +241,7 @@ public class AgentMetaService {
                       agentPO.protocols(),
                       JsonUtils.anyFieldMapper()
                           .getTypeFactory()
-                          .constructArrayType(AgentProtocol.class));
+                          .constructArrayType(AgentProtocolDTO.class));
       Map<String, String> properties =
           versionPO.agentProperties() == null
               ? Collections.emptyMap()

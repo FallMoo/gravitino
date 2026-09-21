@@ -196,6 +196,18 @@ public class NamespaceUtil {
   }
 
   /**
+   * Create a namespace for agent.
+   *
+   * @param metalake The metalake name
+   * @param catalog The catalog name
+   * @param schema The schema name
+   * @return A namespace for agent
+   */
+  public static Namespace ofAgent(String metalake, String catalog, String schema) {
+    return Namespace.of(metalake, catalog, schema);
+  }
+
+  /**
    * Create a namespace for model version.
    *
    * @param metalake The metalake name

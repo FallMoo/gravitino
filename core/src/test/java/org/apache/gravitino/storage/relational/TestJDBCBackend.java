@@ -37,9 +37,11 @@ import org.apache.gravitino.Catalog;
 import org.apache.gravitino.Entity;
 import org.apache.gravitino.MetadataObject;
 import org.apache.gravitino.Namespace;
+import org.apache.gravitino.agent.AgentProtocol;
 import org.apache.gravitino.authorization.Privileges;
 import org.apache.gravitino.authorization.SecurableObject;
 import org.apache.gravitino.authorization.SecurableObjects;
+import org.apache.gravitino.dto.agent.AgentProtocolDTO;
 import org.apache.gravitino.file.Fileset;
 import org.apache.gravitino.function.FunctionDefinition;
 import org.apache.gravitino.function.FunctionDefinitions;
@@ -52,6 +54,7 @@ import org.apache.gravitino.integration.test.util.CloseContainerExtension;
 import org.apache.gravitino.integration.test.util.PrintFuncNameExtension;
 import org.apache.gravitino.job.ShellJobTemplate;
 import org.apache.gravitino.job.SparkJobTemplate;
+import org.apache.gravitino.meta.AgentEntity;
 import org.apache.gravitino.meta.AuditInfo;
 import org.apache.gravitino.meta.BaseMetalake;
 import org.apache.gravitino.meta.CatalogEntity;
@@ -583,6 +586,29 @@ public abstract class TestJDBCBackend {
         .withFunctionType(FunctionType.SCALAR)
         .withDeterministic(false)
         .withDefinitions(new FunctionDefinition[] {definition})
+        .withAuditInfo(auditInfo)
+        .build();
+  }
+
+  protected AgentEntity createAgentEntity(
+      Long id, Namespace namespace, String name, AuditInfo auditInfo) {
+    AgentProtocol[] protocols =
+        new AgentProtocol[] {
+          AgentProtocolDTO.builder()
+              .withType("A2A")
+              .withAgentCardUrl("https://example.com/" + name + "/.well-known/agent.json")
+              .build()
+        };
+    return AgentEntity.builder()
+        .withId(id)
+        .withName(name)
+        .withNamespace(namespace)
+        .withEndpoint("https://example.com/" + name)
+        .withCapabilities(new String[] {"text2sql", "schema-explain"})
+        .withProtocols(protocols)
+        .withOwner("alice")
+        .withComment("test agent comment")
+        .withProperties(ImmutableMap.of("routing.priority", "high"))
         .withAuditInfo(auditInfo)
         .build();
   }
