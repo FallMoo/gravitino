@@ -388,6 +388,19 @@ public class NamespaceUtil {
   }
 
   /**
+   * Check if the given agent namespace is legal, throw an {@link IllegalNamespaceException} if it's
+   * illegal.
+   *
+   * @param namespace The agent namespace
+   */
+  public static void checkAgent(Namespace namespace) {
+    check(
+        namespace != null && namespace.length() == 3,
+        "Agent namespace must be non-null and have 3 levels, the input namespace is %s",
+        namespace);
+  }
+
+  /**
    * Check if the given job template namespace is legal, throw an {@link IllegalNamespaceException}
    *
    * @param namespace The job template namespace

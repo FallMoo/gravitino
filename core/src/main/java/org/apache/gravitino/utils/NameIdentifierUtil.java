@@ -572,6 +572,17 @@ public class NameIdentifierUtil {
   }
 
   /**
+   * Check the given {@link NameIdentifier} is an agent identifier. Throw an {@link
+   * IllegalNameIdentifierException} if it's not.
+   *
+   * @param ident The agent {@link NameIdentifier} to check.
+   */
+  public static void checkAgent(NameIdentifier ident) {
+    NameIdentifier.check(ident != null, "Agent identifier must not be null");
+    NamespaceUtil.checkAgent(ident.namespace());
+  }
+
+  /**
    * Check the given {@link NameIdentifier} is a job identifier. Throw an {@link
    * IllegalNameIdentifierException} if it's not.
    *
