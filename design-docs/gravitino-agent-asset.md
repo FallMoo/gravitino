@@ -50,7 +50,7 @@ Gravitino **目前没有**对 **AI Agent** 的管理能力——这里的 Agent 
 
 1. **Schema 级生命周期**：Agent 在 `(metalake, catalog, schema)` 下管理，通过标准 Gravitino REST API 完成完整 CRUD。其完整标识为 `metalake.catalog.schema.agent`。
 2. **增量变更语义**：所有更新都通过 `AlterAgent` 携带 `AgentChange[]`，与已有的 `TableChange[]` / `ModelChange[]` / `PolicyChange[]` 模式一致，使每一次变更都可独立审计。
-3. **开箱即用的完整治理 mixin**：每个 Agent 实现 `SupportsTags`、`SupportsPolicies`、`SupportsStatistics`；`SupportsRoles` 作为 mixin 占位但 v1 **不**提供 Agent 级的 `grantRole` / `revokeRole` dispatcher（见 §3 非目标 #8），Tag/Policy/Statistics 操作复用既有 dispatcher 链即可生效。
+3. **开箱即用的完整治理 mixin**：Agent 接口暴露 `default supportsTags()` / `default supportsPolicies()` / `default supportsRoles()`（与 `Model` 同构），返回的对象实现了对应的 `SupportsTags` / `SupportsPolicies` / `SupportsRoles` mixin；不支持时抛 `UnsupportedOperationException`。`SupportsStatistics` 不在资产接口上落地（它由 `MetadataObjectStatisticsOperations` 在 metadata-object 维度提供，详见 §3 非目标 #12）；v1 不提供 Agent 级的 `grantRole` / `revokeRole` dispatcher（见 §3 非目标 #8）。
 4. **协议感知的元数据**：Agent 记录携带一份有序的 `AgentProtocol` 描述符列表（`type` + 可选 `agent_card_url`），让下游 dispatcher 可按协议族选取正确的 endpoint。
 5. **自管元数据**：Agent 记录存在 Gravitino 的关系型 `EntityStore` 里，运行不依赖任何外部系统——和没有自带后端存储的 `Function`、`Model` 一致。
 6. **OpenAPI 与客户端齐头并进**：REST API 之外提供完整的 OpenAPI 规范、Java 客户端、Python 客户端。
@@ -71,7 +71,8 @@ Gravitino **目前没有**对 **AI Agent** 的管理能力——这里的 Agent 
 9. **协议 type 重复**：同一 Agent 内 `protocols[].type` 必须唯一，`addProtocol` 遇重复抛 `IllegalArgumentException`。
 10. **Agent 上 Capabilities 区分"未声明 / 声明为空"**：`null` 与空数组统一落库为 `[]`。
 11. **A2A/MCP 协议协议层验证**：`agent_card_url` 是不透明字符串，v1 不抓取、不解析、不做 schema 校验，也不区分 A2A/MCP 是否必填 URL。
-12. **`AgentChange` 上 per-protocol 细粒度 setter**：v1 不提供 `SetProtocolProperty` / `RemoveProtocolProperty`；修改某条既有 protocol 的 `properties` 走 `RemoveProtocol(type)` + `AddProtocol(newProtocol)` 组合实现（详见 §5.1 AgentProtocol 表的"作用域区分"）。`AgentChange` 类总数保持 9 个。
+12. **`SupportsStatistics` 在 Agent 接口层落地**：与 `Model` 一致——`SupportsStatistics` 只由 `MetadataObjectStatisticsOperations` 在 metadata-object 维度实现，不在资产接口（`Agent`、`Model`）上 `extends`。
+13. **`AgentChange` 上 per-protocol 细粒度 setter**：v1 不提供 `SetProtocolProperty` / `RemoveProtocolProperty`；修改某条既有 protocol 的 `properties` 走 `RemoveProtocol(type)` + `AddProtocol(newProtocol)` 组合实现（走法 B-1，详见 §5.1 AgentProtocol 表的"作用域区分"）。`AgentChange` 类总数保持 9 个。
 
 ---
 
@@ -133,13 +134,15 @@ Gravitino **目前没有**对 **AI Agent** 的管理能力——这里的 Agent 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `name` | string | 是 | schema 内唯一。由 Gravitino 标准命名校验器校验。 |
-| `endpoint` | string (URI) | 是 | Agent 接收请求的 URL。存储为不透明字符串，不强制协议。 |
-| `capabilities` | string[] | 否 | 自由形式的能力标签（如 `text2sql`、`schema-explain`）。`null` 与空数组等价，统一落库为 `[]`（v1 不区分"未声明"与"声明为空"）。 |
-| `protocols` | `AgentProtocol[]` | 否 | 有序的协议描述符列表，见下表。同一 Agent 内 `protocols[].type` **不可重复**；重复时 `addProtocol` 抛 `IllegalArgumentException`。 |
-| `owner` | string | 否 | 逻辑所有者（通常是用户名）。与 RBAC owner 独立。 |
+| `endpoint` | string (URI) | 是 | Agent 接收请求的 URL。存储为不透明字符串，不强制协议。在 Java 接口上 `String endpoint()` 不带 default（对齐 `Model.name()`、`Model.latestVersion()` 的非 default 形态）。 |
+| `capabilities` | string[] | 否 | 自由形式的能力标签（如 `text2sql`、`schema-explain`）。`null` 与空数组等价，统一落库为 `[]`（v1 不区分"未声明"与"声明为空"）。Java 接口 `default` 返回 `new String[0]`。 |
+| `protocols` | `AgentProtocol[]` | 否 | 有序的协议描述符列表，见下表。同一 Agent 内 `protocols[].type` **不可重复**；重复时 `addProtocol` 抛 `IllegalArgumentException`。Java 接口 `default` 返回 `new AgentProtocol[0]`。 |
+| `owner` | string | 是 | 逻辑所有者（通常是用户名）。与 RBAC owner 独立。Java 接口 `String owner()` 不带 default，与 `Model` 一致。 |
 | `comment` | string | 否 | 人类可读的描述。 |
-| `properties` | string→string map | 否 | 预留扩展位，v1 核心实现不读。 |
+| `properties` | string→string map | 否 | 预留扩展位，v1 核心实现不读。Java 接口 `default` 返回 `Collections.emptyMap()`。 |
 | `audit_info` | object | 自动 | `creator`、`create_time`、`last_modifier`、`last_modified_time`（继承自 `Auditable`）。 |
+
+> **与 `Model` 对齐细节**：Agent 不 `extends HasIdentifier`（api 模块里 `HasIdentifier` 仅在 core Entity 层使用）；Agent 不 `extends SupportsStatistics`（`SupportsStatistics` 仅由 `MetadataObjectStatisticsOperations` 在 metadata-object 维度实现，不下沉到资产接口，参见 §3 非目标 #12）；Tag/Policy/Role 通过 `default supportsTags() / supportsPolicies() / supportsRoles()` 暴露（对齐 `Model.java:84-102`）。
 
 #### AgentProtocol 对象
 
@@ -158,18 +161,38 @@ Agent 接口族沿用 Function 的包路径与命名约定，放在 `org.apache.
 #### `org.apache.gravitino.agent.Agent`
 
 ```java
+package org.apache.gravitino.agent;
+
+import java.util.Collections;
+import java.util.Map;
+import javax.annotation.Nullable;
+import org.apache.gravitino.Auditable;
+import org.apache.gravitino.annotation.Evolving;
+import org.apache.gravitino.authorization.SupportsRoles;
+import org.apache.gravitino.policy.SupportsPolicies;
+import org.apache.gravitino.tag.SupportsTags;
+
 @Evolving
-public interface Agent
-    extends Auditable, HasIdentifier, SupportsTags, SupportsPolicies,
-            SupportsRoles, SupportsStatistics {
+public interface Agent extends Auditable {
 
   String name();
   String endpoint();
-  String[] capabilities();
-  AgentProtocol[] protocols();
-  @Nullable String owner();
-  @Nullable String comment();
-  Map<String, String> properties();
+  String owner();
+
+  default String[] capabilities() { return new String[0]; }
+  default AgentProtocol[] protocols() { return new AgentProtocol[0]; }
+  @Nullable default String comment() { return null; }
+  default Map<String, String> properties() { return Collections.emptyMap(); }
+
+  default SupportsTags supportsTags() {
+    throw new UnsupportedOperationException("Agent does not support tag operations.");
+  }
+  default SupportsPolicies supportsPolicies() {
+    throw new UnsupportedOperationException("Agent does not support policy operations.");
+  }
+  default SupportsRoles supportsRoles() {
+    throw new UnsupportedOperationException("Agent does not support role operations.");
+  }
 }
 ```
 
@@ -455,7 +478,7 @@ Client → AgentOperations (JAX-RS)
   - `REGISTER_AGENT`：schema 级，等价于 Function 的 `REGISTER_FUNCTION`，bit 值沿用下一个可用槽位。
   - `EXECUTE_AGENT`：agent 级，"发现 + 调用" 入口权限；不在 `AgentCatalog` 方法上直接校验，由 dispatcher 视上下文决定。
   - `MODIFY_AGENT`：schema 级，覆盖 alter / drop（与 `MODIFY_FUNCTION` 同——drop 走 modify 语义）。
-- `AGENT` 加入 `MetadataObject.Type` 枚举、`Entity.EntityType` 枚举；`MetadataObjects.java` 三个 switch 全加 case；`MetadataObjectUtil.toEntityType(...)` 增加 `MetadataObject.Type.AGENT → Entity.EntityType.AGENT` 映射；`Privileges.java` 新增 `AGENT_SUPPORTED_TYPES` 并加入 `MANAGE_GRANTS_SUPPORTED_TYPES`。
+- `AGENT` 加入 `MetadataObject.Type` 枚举、`Entity.EntityType` 枚举；`MetadataObjects.java` 的 `parent()` switch 加 `case AGENT`（与 `FUNCTION` 共用 SCHEMA 父节点），同时把 `AGENT` 加入 `VALID_THREE_LEVEL_NAME_TYPES` 集合；`MetadataObjectUtil.toEntityType(...)` 增加 `MetadataObject.Type.AGENT → Entity.EntityType.AGENT` 映射；`Privileges.java` 新增 `AGENT_SUPPORTED_TYPES` 并加入 `MANAGE_GRANTS_SUPPORTED_TYPES`。
 - 新增常量在 `Privileges.allow(...)` switch 里沿用 `RegisterFunction.allow()` 模式（每个权限单独 final class `RegisterAgent.allow()` / `ExecuteAgent.allow()` / `ModifyAgent.allow()`）。
 - jcasbin GRule 模型扩展：定位 `server-common/src/main/resources/jcasbin/` 下的 `*.conf` model 文件，参考 Function 的 `g_function` / `p_function` 规则新增 `g_agent` / `p_agent` 规则，并在 metalake 默认 policy 中补 AGENT 相关项。
 - Tag/policy 绑定走既有 `APPLY_TAG` / `APPLY_POLICY`，无需新增。
@@ -491,11 +514,11 @@ Client → AgentOperations (JAX-RS)
 
 ### Phase 1：核心 API 与存储
 
-- [ ] 在 `MetadataObject.Type` 枚举加入 `AGENT`，在 `Entity.EntityType` 枚举加入 `AGENT`，并在 `api/MetadataObjects.java` 三个 switch 全加 case（参照现有 `FUNCTION` case 写法）
+- [ ] 在 `MetadataObject.Type` 枚举加入 `AGENT`，在 `Entity.EntityType` 枚举加入 `AGENT`，并在 `api/MetadataObjects.java` 的 `parent()` switch 加 `case AGENT`（与 `FUNCTION` 共用 SCHEMA 父节点），同时把 `AGENT` 加入 `VALID_THREE_LEVEL_NAME_TYPES` 集合
 - [ ] 在 `api/src/main/java/org/apache/gravitino/agent/` 定义 `Agent`、`AgentProtocol`、`AgentChange`（含 `RenameAgent` / `SetProperty` / `RemoveProperty` / `AddProtocol` / `RemoveProtocol` / `AddCapability` / `RemoveCapability` / `UpdateComment` / `SetOwner` 9 个嵌套 final class 与对应静态工厂方法），参照 `FunctionChange.java`
 - [ ] 在 `api/agent/` 定义 `AgentCatalog` 能力接口（含 `default agentExists`）；参照 `FunctionCatalog.java`
 - [ ] 在 `api/exceptions/` 新增 `AgentAlreadyExistsException` 与 `NoSuchAgentException`，参照 `FunctionAlreadyExistsException` / `NoSuchFunctionException`
-- [ ] 在 `core/src/main/java/org/apache/gravitino/meta/` 实现 `AgentEntity`（实现 `Entity`、`Auditable`、`HasIdentifier`、`Agent`）
+- [ ] 在 `core/src/main/java/org/apache/gravitino/meta/` 实现 `AgentEntity`（实现 `Entity`、`Auditable`、`Agent`；`HasIdentifier` 通过 `Entity` 接口的 identifier 字段满足；`SupportsTags/Policies/Roles` 由 `Agent` 接口的 default 方法实现）
 - [ ] 在 `core/src/main/java/org/apache/gravitino/storage/relational/po/` 定义 `AgentPO` 与 `AgentVersionPO`
 - [ ] 在 `core/src/main/java/org/apache/gravitino/storage/relational/mapper/` 定义 `AgentMetaMapper`、`AgentVersionMetaMapper` 接口与 `AgentMetaSQLProviderFactory`（含 H2/MySQL/PostgreSQL 三个 dialect provider），参照 `FunctionMetaSQLProviderFactory` 的三 provider 结构
 - [ ] 在 `MapperHelpers` 注册新 mapper，在 `JdbcDatabase` 注册 JDBC config
@@ -563,6 +586,7 @@ Client → AgentOperations (JAX-RS)
 - [x] 新 REST API 定义了请求 / 响应 / 行为 / 鉴权
 - [x] Task Breakdown 每项对应一个 PR，按依赖顺序、按 Phase 分组
 - [x] 全程与 `org.apache.gravitino.function.*`（Function 资产）保持命名、注解、异常、dispatcher 链、SQL provider 结构对齐
+- [x] 与 `org.apache.gravitino.model.Model` 实际形态对齐：`Agent` 仅 `extends Auditable`，治理能力通过 `default supportsTags()/supportsPolicies()/supportsRoles()` 暴露；`SupportsStatistics` 不在资产接口落地，由 `MetadataObjectStatisticsOperations` 在 metadata-object 维度提供；`HasIdentifier` 仅在 core Entity 层使用
 - [x] `protocols[].type` 唯一约束：`addProtocol` 遇重复抛 `IllegalArgumentException`（见 §3 非目标 #9、§5.2 AgentChange 表）
 - [x] Role 绑定范围：v1 不实现 Agent 级 `grantRole` / `revokeRole` dispatcher，`SupportsRoles` 仅作 mixin 占位（见 §3 非目标 #8、§5.6 鉴权集成）
 - [x] `agent_card_url` 是不透明可选字段，v1 不抓取、不解析（见 §3 非目标 #11、§5.1 AgentProtocol 表）
