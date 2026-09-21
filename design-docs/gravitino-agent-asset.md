@@ -346,7 +346,14 @@ Tag 和 policy 绑定端点会复用 Gravitino 现有的 `MetadataObjectTagOpera
 
 ### 5.4 持久化 Schema
 
-按 Function 的既有约定：**没有 SQL 迁移脚本**。表结构由 MyBatis SQL provider 生成（`AgentMetaBaseSQLProvider`），并由 `AgentMetaSQLProviderFactory` 按 JDBC 后端（H2 / MySQL / PostgreSQL）派发具体方言。
+Agent 资产是**纯新增表**，沿用 Gravitino 的"两份真相"机制：
+
+- **`scripts/{h2,mysql,postgresql}/schema-1.3.0-*.sql`** 是官方发布的 reference schema。每个 release 一份完整 DDL；ops 拿它做生产 init 或 sanity check。Agent 在 1.3.0 release 中追加 `agent_meta` + `agent_version_info` 两段 `CREATE TABLE`。
+- **MyBatis 自动建表**（`gravitino.entity.store.auto-create-table=true` 时）在 server 启动时按 mapper 注解 / Provider 反射建表，是 dev / 单测场景的兜底；**生产部署仍应跑 scripts 里的 SQL**，不要依赖自动建表。
+
+Agent 是新表，**不需要** `upgrade-1.x-to-1.y-*.sql`：1.3.0 之前的版本根本不存在 `agent_meta`，所以没有"老 Gravitino 升级到带 Agent 的 Gravitino"这条路径——部署 1.3.0 必须 fresh init schema-1.3.0-*.sql。**未来**对 agent_meta / agent_version_info 的列变更（如 1.4.0 加列）需要新增 `upgrade-1.3.0-to-1.4.0-*.sql`，沿用现有 `upgrade-*.sql` 命名约定。
+
+Agent 的两个 mapper / provider（`AgentMetaMapper` + `AgentMetaBaseSQLProvider` + `AgentMetaPostgreSQLProvider`，以及对应的版本表）按 Function 的同构方式生成三方言 SQL，但**只有 dev/test 路径**用——生产路径走 scripts/。
 
 新增两张表，建模参考 `function_meta` 与 `function_version_info`：
 
@@ -523,6 +530,7 @@ Client → AgentOperations (JAX-RS)
 - [ ] 在 `core/src/main/java/org/apache/gravitino/storage/relational/mapper/` 定义 `AgentMetaMapper`、`AgentVersionMetaMapper` 接口与 `AgentMetaSQLProviderFactory`（含 H2/MySQL/PostgreSQL 三个 dialect provider），参照 `FunctionMetaSQLProviderFactory` 的三 provider 结构
 - [ ] 在 `MapperHelpers` 注册新 mapper，在 `JdbcDatabase` 注册 JDBC config
 - [ ] 实现 `AgentMetaService` 处理 PO ↔ Entity 转换（参照 `FunctionMetaService`，含软删除与版本写入）
+- [ ] 在 `scripts/{h2,mysql,postgresql}/schema-1.3.0-*.sql` 末尾追加 `agent_meta` + `agent_version_info` 的 `CREATE TABLE`（参考 `function_meta` 段；H2/MySQL 用反引号 + ENGINE=InnoDB，PostgreSQL 用双引号 + `COMMENT ON` + 独立 `CREATE INDEX`）
 - [ ] 在 `common/src/main/java/org/apache/gravitino/dto/agent/` 增加 `AgentDTO`、`AgentProtocolDTO`、`AgentRegisterRequest`、`AgentRegisterResponse`、`AgentListResponse`、`AgentResponse`、`AgentUpdatesRequest`，以及对应的 `ErrorConstants` 错误码
 - [ ] 在 `DTOConverters` 增加 `toAgentDTO(...)`、`toAgentProtocolDTO(...)`、`fromAgentRequest(...)`、`fromAgentProtocolRequest(...)`
 - [ ] 在 `api/authorization/Privileges.java` 增加 `REGISTER_AGENT` / `EXECUTE_AGENT` / `MODIFY_AGENT` 三个 `Privilege.Name` 与 `RegisterAgent.allow()` / `ExecuteAgent.allow()` / `ModifyAgent.allow()` final class；同时新增 `AGENT_SUPPORTED_TYPES` 并加入 `MANAGE_GRANTS_SUPPORTED_TYPES`
