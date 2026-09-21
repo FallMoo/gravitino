@@ -240,15 +240,6 @@ public interface AgentCatalog {
   NameIdentifier[] listAgents(Namespace namespace) throws NoSuchSchemaException;
 
   /**
-   * List the agents with details in a schema.
-   *
-   * @param namespace A namespace.
-   * @return An array of agents in the namespace.
-   * @throws NoSuchSchemaException If the schema does not exist.
-   */
-  Agent[] listAgentInfos(Namespace namespace) throws NoSuchSchemaException;
-
-  /**
    * Get an agent by {@link NameIdentifier}.
    *
    * @param ident An agent identifier. Must be a function/agent identifier.
@@ -281,7 +272,8 @@ public interface AgentCatalog {
    * @param protocols Optional ordered protocol descriptors.
    * @param comment The optional agent comment.
    * @param properties Optional user-defined properties (may be null).
-   * @param owner The optional logical owner.
+   * @param owner The logical owner of the agent. Required, must be non-blank; aligned with
+   *     Model.owner / Model.name non-default shape.
    * @return The registered agent.
    * @throws NoSuchSchemaException If the schema does not exist.
    * @throws AgentAlreadyExistsException If the agent already exists.
@@ -293,7 +285,7 @@ public interface AgentCatalog {
       @Nullable AgentProtocol[] protocols,
       @Nullable String comment,
       @Nullable Map<String, String> properties,
-      @Nullable String owner)
+      String owner)
       throws NoSuchSchemaException, AgentAlreadyExistsException;
 
   /**
@@ -318,7 +310,7 @@ public interface AgentCatalog {
 }
 ```
 
-> 与 Function 的对齐要点：`listAgents(Namespace)` 返回 `NameIdentifier[]`，`listAgentInfos(Namespace)` 返回 `Agent[]`，`agentExists` 是 `default` 实现；`alterAgent` 用可变参数 `AgentChange...` 而不是数组；`dropAgent` 不抛 `NoSuchAgentException`（不存在时返回 `false`）。
+> 与 Function 的对齐要点：`listAgents(Namespace)` 返回 `NameIdentifier[]`，**没有** `listAgentInfos`（Model 也没有），需要详情时 caller 直接循环 `getAgent`；`agentExists` 是 `default` 实现；`alterAgent` 用可变参数 `AgentChange...` 而不是数组；`dropAgent` 不抛 `NoSuchAgentException`（不存在时返回 `false`）。
 
 ### 5.3 REST API
 
@@ -449,35 +441,48 @@ CREATE TABLE agent_version_info (
 
 ### 5.6 实现流程
 
-Agent 资产复用 Gravitino 的五层 dispatcher 链（Function/Model 模式）：
+Agent 资产复用 Gravitino 的四层 dispatcher 链（Function 模式，自外到内）：
 
 ```
 Client → AgentOperations (JAX-RS)
          │
          ▼
-       AgentEventDispatcher      ← PreEvent / PostEvent / FailureEvent
+       AgentHookDispatcher        ← 纯委派，为未来 hook 留口
          │
          ▼
-       AgentHookDispatcher       ← 可选用户 hook
+       AgentEventDispatcher       ← PreEvent / PostEvent / FailureEvent
          │
          ▼
-       AgentNormalizeDispatcher  ← 入参规范化
+       AgentNormalizeDispatcher   ← 入参规范化
          │
          ▼
-       AgentOperationDispatcher  ← TreeLock、jcasbin 鉴权、业务逻辑
+       AgentOperationDispatcher   ← TreeLock、jcasbin 鉴权、业务逻辑
          │
-         ├─► AgentMetaService     ← PO ↔ Entity 转换
-         │       │
-         │       ▼
-         │   AgentMetaMapper      ← MyBatis
-         │       │
-         │       ▼
-         │   JDBC → H2/MySQL/PG
+         ▼
+       ManagedAgentOperations     ← 实现 AgentCatalog，通过 EntityStore 抽象层调存储
          │
-         └─► EventBus             ← audit-log 监听器、Lineage、自定义
+         ▼
+       EntityStore (RelationalEntityStore)
+         │
+         ▼
+       AgentMetaService            ← PO ↔ Entity 转换（仅 JDBCBackend 内部用）
+         │
+         ▼
+       AgentMetaMapper (MyBatis)   ← 三方言 SQL provider
+         │
+         ▼
+       JDBC → H2/MySQL/PG
+
+EventBus → audit-log 监听器、Lineage、自定义
 ```
 
-每一层都是一个独立的类，方便以后替换（例如未来挂一个 `RangerHookDispatcher`）。装配在 `GravitinoEnv` 里完成，与现有 `FunctionDispatcher` 注册流程相同。
+**装配顺序（与 Function 完全一致）**：在 `GravitinoEnv.start()` 里，`AgentOperationDispatcher` 是最内层，依次包 `AgentNormalizeDispatcher` / `AgentEventDispatcher` / `AgentHookDispatcher`，最终通过 `GravitinoEnv.agentDispatcher()` 暴露。每层都是独立类，方便替换（未来可挂 `RangerHookDispatcher`）。
+
+**调用顺序**：client → HookDispatcher → EventDispatcher (PreEvent) → NormalizeDispatcher → OperationDispatcher (TreeLock + jcasbin + ManagedAgentOperations) → EventDispatcher (PostEvent / FailureEvent)。
+
+**与 Function 的关键差异**：
+- 没有 `ManagedAgentOperations` 之外的独立 `AgentNormalizeDispatcher.normalizeCapability(...)` 之类的领域校验——所有校验在 `ManagedAgentOperations.registerAgent` / `applyChanges` 里集中完成。
+- v1 不实现 `AgentHookDispatcher.alterAgentPreCheck` 等 owner / privilege 检查（与 Function 一致）。
 
 #### 鉴权集成
 
@@ -540,13 +545,13 @@ Client → AgentOperations (JAX-RS)
 
 ### Phase 2：Dispatcher 链
 
-- [ ] 在 `core/src/main/java/org/apache/gravitino/agent/` 定义 `AgentDispatcher` 接口（参照 `FunctionDispatcher` 公开方法签名）
+- [x] 在 `core/src/main/java/org/apache/gravitino/catalog/` 定义 `AgentDispatcher` 接口（参照 `FunctionDispatcher`，是空接口仅 extends `AgentCatalog`）
 - [ ] 实现 `AgentOperationDispatcher`（TreeLock、命名空间校验、jcasbin 调用、业务逻辑），参照 `FunctionDispatcher` 实现
-- [ ] 实现 `AgentNormalizeDispatcher`（入参规范化、默认值），规范化规则：`properties == null → empty map`、`capabilities/protocols == null → null`、`endpoint` 不 trim trailing slash
+- [ ] 实现 `AgentNormalizeDispatcher`（入参规范化、默认值），规范化规则：`properties == null → empty map`、`capabilities/protocols == null → []`、`endpoint` 不 trim trailing slash
 - [ ] 实现 `AgentHookDispatcher`（纯委派，为未来 hook 留口），参照 `FunctionHookDispatcher`
 - [ ] 实现 `AgentEventDispatcher`（PreEvent / PostEvent / FailureEvent），参照 `FunctionEventDispatcher`
-- [ ] 在 `core/src/main/java/org/apache/gravitino/listener/api/event/` 定义 `CreateAgentEvent`、`AlterAgentEvent`、`DeleteAgentEvent`、`GetAgentEvent`、`ListAgentsEvent`、`AgentExistsEvent`、`AgentFailureEvent`（命名空间 `org.apache.gravitino.listener.api.event.agent.*`，与 `function.*` / `model.*` 并列）
-- [ ] 在 `core/src/main/java/org/apache/gravitino/catalog/` 实现 `ManagedAgentOperations`，对接 `AgentCatalog` 接口
+- [ ] 在 `core/src/main/java/org/apache/gravitino/listener/api/event/agent/` 定义 21 个事件类（命名空间 `org.apache.gravitino.listener.api.event.agent.*`，与 `function.*` / `model.*` 并列）—— 实际事件清单按 Function 1:1 镜像：`RegisterAgentEvent` / `RegisterAgentPreEvent` / `RegisterAgentFailureEvent` + `AlterAgentEvent` / `AlterAgentPreEvent` / `AlterAgentFailureEvent` + `DropAgentEvent` / `DropAgentPreEvent` / `DropAgentFailureEvent` + `GetAgentEvent` / `GetAgentPreEvent` / `GetAgentFailureEvent` + `ListAgentsEvent` / `ListAgentsPreEvent` / `ListAgentsFailureEvent` + `AgentExistsEvent` / `AgentExistsPreEvent` + 顶层基类 `AgentEvent` / `AgentPreEvent` / `AgentFailureEvent` + `AgentInfoEvent`（Function 同样有此中间基类）。任务清单原列的 `AgentFailureEvent` 已在顶层基类覆盖。
+- [x] 在 `core/src/main/java/org/apache/gravitino/catalog/` 实现 `ManagedAgentOperations`，对接 `AgentCatalog` 接口（Phase 2 Subtask A 落地：commit `68b7d7469`）
 - [ ] 把 `AgentDispatcher` 装配进 `GravitinoEnv` 初始化流程
 - [ ] 为 dispatcher 链补单元测试（规范化、hook、事件发布）
 
