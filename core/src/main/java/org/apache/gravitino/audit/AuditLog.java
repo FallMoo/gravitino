@@ -484,6 +484,16 @@ public interface AuditLog {
 
     LIST_FUNCTION_INFOS,
 
+    REGISTER_AGENT,
+
+    GET_AGENT,
+
+    ALTER_AGENT,
+
+    DROP_AGENT,
+
+    LIST_AGENT,
+
     AUTHORIZATION_DENIAL,
 
     UNKNOWN_OPERATION;

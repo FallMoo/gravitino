@@ -181,6 +181,11 @@ public class CompatibilityUtils {
           .put(OperationType.DROP_FUNCTION, Operation.DROP_FUNCTION)
           .put(OperationType.LIST_FUNCTION, Operation.LIST_FUNCTION)
           .put(OperationType.LIST_FUNCTION_INFOS, Operation.LIST_FUNCTION_INFOS)
+          .put(OperationType.REGISTER_AGENT, Operation.REGISTER_AGENT)
+          .put(OperationType.GET_AGENT, Operation.GET_AGENT)
+          .put(OperationType.ALTER_AGENT, Operation.ALTER_AGENT)
+          .put(OperationType.DROP_AGENT, Operation.DROP_AGENT)
+          .put(OperationType.LIST_AGENT, Operation.LIST_AGENT)
           .put(OperationType.AUTHORIZATION_DENIAL, Operation.AUTHORIZATION_DENIAL)
           .put(OperationType.UNKNOWN, Operation.UNKNOWN_OPERATION)
           .build();
