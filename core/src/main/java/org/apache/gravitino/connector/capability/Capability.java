@@ -42,7 +42,8 @@ public interface Capability {
     TOPIC,
     PARTITION,
     MODEL,
-    FUNCTION
+    FUNCTION,
+    AGENT
   }
 
   /**
