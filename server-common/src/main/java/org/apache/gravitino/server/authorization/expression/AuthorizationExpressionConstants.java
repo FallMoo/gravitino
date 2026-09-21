@@ -110,6 +110,21 @@ public class AuthorizationExpressionConstants {
                   ANY_MODIFY_FUNCTION
                   """;
 
+  public static final String LOAD_AGENT_AUTHORIZATION_EXPRESSION =
+      """
+            ANY(OWNER, METALAKE, CATALOG) ||
+             SCHEMA_OWNER_WITH_USE_CATALOG ||
+              ANY_USE_CATALOG && ANY_USE_SCHEMA
+              && (AGENT::OWNER || ANY_EXECUTE_AGENT || ANY_MODIFY_AGENT)
+                  """;
+
+  public static final String FILTER_AGENT_AUTHORIZATION_EXPRESSION =
+      """
+                  ANY(OWNER, METALAKE, CATALOG, SCHEMA, AGENT) ||
+                  ANY_EXECUTE_AGENT ||
+                  ANY_MODIFY_AGENT
+                  """;
+
   public static final String LOAD_VIEW_AUTHORIZATION_EXPRESSION =
       """
                   ANY(OWNER, METALAKE, CATALOG) ||

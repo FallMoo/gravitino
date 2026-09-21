@@ -17,6 +17,7 @@
 
 package org.apache.gravitino.server.authorization.expression;
 
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_AGENT_AUTHORIZATION_EXPRESSION;
 import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_CATALOG_AUTHORIZATION_EXPRESSION;
 import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_FILESET_AUTHORIZATION_EXPRESSION;
 import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_FUNCTION_AUTHORIZATION_EXPRESSION;
@@ -185,7 +186,8 @@ public class AuthorizationExpressionConverter {
               ( entityType == 'JOB' && (%s)) ||
               ( entityType == 'JOB_TEMPLATE' && (%s)) ||
               ( entityType == 'COLUMN' && (%s)) ||
-              ( entityType == 'FUNCTION' && (%s))
+              ( entityType == 'FUNCTION' && (%s)) ||
+              ( entityType == 'AGENT' && (%s))
               """
             .formatted(
                 LOAD_CATALOG_AUTHORIZATION_EXPRESSION,
@@ -202,7 +204,8 @@ public class AuthorizationExpressionConverter {
                 LOAD_JOB_AUTHORIZATION_EXPRESSION,
                 LOAD_JOB_TEMPLATE_AUTHORIZATION_EXPRESSION,
                 LOAD_TABLE_AUTHORIZATION_EXPRESSION,
-                LOAD_FUNCTION_AUTHORIZATION_EXPRESSION));
+                LOAD_FUNCTION_AUTHORIZATION_EXPRESSION,
+                LOAD_AGENT_AUTHORIZATION_EXPRESSION));
   }
 
   /**
@@ -312,6 +315,21 @@ public class AuthorizationExpressionConverter {
             "ANY_MODIFY_FUNCTION",
             "((ANY(MODIFY_FUNCTION, METALAKE, CATALOG, SCHEMA, FUNCTION)) "
                 + "&& !(ANY(DENY_MODIFY_FUNCTION, METALAKE, CATALOG, SCHEMA, FUNCTION)))");
+    expression =
+        expression.replaceAll(
+            "ANY_REGISTER_AGENT",
+            "((ANY(REGISTER_AGENT, METALAKE, CATALOG, SCHEMA)) "
+                + "&& !(ANY(DENY_REGISTER_AGENT, METALAKE, CATALOG, SCHEMA)))");
+    expression =
+        expression.replaceAll(
+            "ANY_EXECUTE_AGENT",
+            "((ANY(EXECUTE_AGENT, METALAKE, CATALOG, SCHEMA, AGENT)) "
+                + "&& !(ANY(DENY_EXECUTE_AGENT, METALAKE, CATALOG, SCHEMA, AGENT)))");
+    expression =
+        expression.replaceAll(
+            "ANY_MODIFY_AGENT",
+            "((ANY(MODIFY_AGENT, METALAKE, CATALOG, SCHEMA, AGENT)) "
+                + "&& !(ANY(DENY_MODIFY_AGENT, METALAKE, CATALOG, SCHEMA, AGENT)))");
     expression =
         expression.replaceAll(
             "ANY_CREATE_TOPIC",
