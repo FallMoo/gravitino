@@ -669,6 +669,11 @@ public class NameIdentifierUtil {
         String functionParent = dot.join(ident.namespace().level(1), ident.namespace().level(2));
         return MetadataObjects.of(functionParent, ident.name(), MetadataObject.Type.FUNCTION);
 
+      case AGENT:
+        checkAgent(ident);
+        String agentParent = dot.join(ident.namespace().level(1), ident.namespace().level(2));
+        return MetadataObjects.of(agentParent, ident.name(), MetadataObject.Type.AGENT);
+
       case ROLE:
         AuthorizationUtils.checkRole(ident);
         return MetadataObjects.of(null, ident.name(), MetadataObject.Type.ROLE);
