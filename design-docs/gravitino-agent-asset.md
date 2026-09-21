@@ -524,6 +524,7 @@ EventBus → audit-log 监听器、Lineage、自定义
 > - **PR（Phase PR）** = Phase 边界。Phase 1、Phase 2、Phase 3、Phase 4 各自 1 个 PR（独立可编译、可测、可 squash merge）；Phase 5 + Phase 6 合并为 1 个 PR（纯文档 + 发布流程）。**总计 5–6 个 PR**。
 > - **测试前置**：每个 Phase 的单元测试在**该 Phase 内**完成，**不**延后到 Phase 5。Phase 5 只负责 OpenAPI / 用户文档 / 集成测试 / 发布。**测试滞后会导致 bug 漏过 phase 边界**（真实教训：Phase 1 #9 AgentMetaService 没单测，潜伏了 4 个 bug 到 Phase 5 阶段才被 test 触发修——`AgentProtocol` 反序列化接口失败、`deleteAgent` 缺 NotFound catch、`applyChanges` 私有无法复用、`NameIdentifierUtil.toMetadataObject` 不识 AGENT）。
 > - 拆分原则：每个 Phase PR 必须是"自包含"——能 `./gradlew compileJava test -PskipITs` 通过；不允许 Phase 1 PR 引用 Phase 2 才出现的新类。
+> - **PR-level 完整构建**：每个 Phase PR 提交前**必须** `./gradlew compileDistribution -x test` 通过。这会顺带验证 `:api:javadoc`（api 模块跑 javadoc 配 `-Werror`，新 public 方法漏 Javadoc 就会失败）、checkstyle、spotless 等所有静态检查。**这一条比单元测试更严**，能抓到像"public 方法漏 @return Javadoc"这种只靠 test 抓不到的 bug。真实教训：Phase 1 #2 AgentChange 9 个 getter 漏 Javadoc，单元测试全过，但 `compileDistribution` 失败——补 commit `08e5ee816` 才修。
 
 ### Phase 1：核心 API 与存储
 

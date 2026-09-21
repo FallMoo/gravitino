@@ -134,6 +134,9 @@ public interface AgentChange {
       this.newName = newName;
     }
 
+    /**
+     * @return The new agent name.
+     */
     public String newName() {
       return newName;
     }
@@ -173,10 +176,16 @@ public interface AgentChange {
       this.value = value;
     }
 
+    /**
+     * @return The property name being set or removed.
+     */
     public String property() {
       return property;
     }
 
+    /**
+     * @return The property value being set.
+     */
     public String value() {
       return value;
     }
@@ -214,6 +223,9 @@ public interface AgentChange {
       this.property = property;
     }
 
+    /**
+     * @return The property name being set or removed.
+     */
     public String property() {
       return property;
     }
@@ -249,6 +261,9 @@ public interface AgentChange {
       this.protocol = protocol;
     }
 
+    /**
+     * @return The protocol descriptor being added.
+     */
     public AgentProtocol protocol() {
       return protocol;
     }
@@ -285,6 +300,9 @@ public interface AgentChange {
       this.type = type;
     }
 
+    /**
+     * @return The protocol type identifying the protocol to remove.
+     */
     public String type() {
       return type;
     }
@@ -322,6 +340,9 @@ public interface AgentChange {
       this.capability = capability;
     }
 
+    /**
+     * @return The capability tag being added or removed.
+     */
     public String capability() {
       return capability;
     }
@@ -359,6 +380,9 @@ public interface AgentChange {
       this.capability = capability;
     }
 
+    /**
+     * @return The capability tag being added or removed.
+     */
     public String capability() {
       return capability;
     }
@@ -396,6 +420,9 @@ public interface AgentChange {
       this.newComment = newComment;
     }
 
+    /**
+     * @return The new agent comment.
+     */
     public String newComment() {
       return newComment;
     }
@@ -432,6 +459,9 @@ public interface AgentChange {
       this.newOwner = newOwner;
     }
 
+    /**
+     * @return The new agent owner.
+     */
     public String newOwner() {
       return newOwner;
     }
