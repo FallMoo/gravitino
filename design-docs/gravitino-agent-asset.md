@@ -71,6 +71,7 @@ Gravitino **目前没有**对 **AI Agent** 的管理能力——这里的 Agent 
 9. **协议 type 重复**：同一 Agent 内 `protocols[].type` 必须唯一，`addProtocol` 遇重复抛 `IllegalArgumentException`。
 10. **Agent 上 Capabilities 区分"未声明 / 声明为空"**：`null` 与空数组统一落库为 `[]`。
 11. **A2A/MCP 协议协议层验证**：`agent_card_url` 是不透明字符串，v1 不抓取、不解析、不做 schema 校验，也不区分 A2A/MCP 是否必填 URL。
+12. **`AgentChange` 上 per-protocol 细粒度 setter**：v1 不提供 `SetProtocolProperty` / `RemoveProtocolProperty`；修改某条既有 protocol 的 `properties` 走 `RemoveProtocol(type)` + `AddProtocol(newProtocol)` 组合实现（详见 §5.1 AgentProtocol 表的"作用域区分"）。`AgentChange` 类总数保持 9 个。
 
 ---
 
@@ -146,6 +147,9 @@ Gravitino **目前没有**对 **AI Agent** 的管理能力——这里的 Agent 
 | --- | --- | --- | --- |
 | `type` | string | 是 | 协议族标识（如 `"A2A"`、`"MCP"`）。自由字符串，Gravitino 不维护枚举。同 Agent 内 `type` 唯一，参见上表约束。 |
 | `agent_card_url` | string (URI) | 否 | 协议描述符（如 A2A agent card）的获取 URL。v1 不强制非空、不抓取、不解析；保留为可选字段。 |
+| `properties` | string→string map | 否 | 协议级扩展位（`auth`、`preferredTransport`、`version` 等）。Gravitino 不解释键值，原样存取。作用域窄于 Agent 级 `properties`：per-agent keys 覆盖整 agent 的运维（如 `rate-limit.rpm`），per-protocol keys 覆盖协议连接细节。Java 接口 `default` 返回 `Collections.emptyMap()`。 |
+
+> **作用域区分**：`Agent.properties` 是整个 Agent 的运维元数据（如 `rate-limit.rpm`、`routing.priority`）；`AgentProtocol.properties` 是该协议连接时的细节（如 A2A 的 `auth=bearer`、`preferredTransport=jsonrpc+http`）。两者命名相同但作用域不同，文档全文一致使用此约定。
 
 ### 5.2 Java API
 

@@ -18,6 +18,8 @@
  */
 package org.apache.gravitino.agent;
 
+import java.util.Collections;
+import java.util.Map;
 import javax.annotation.Nullable;
 import org.apache.gravitino.annotation.Evolving;
 
@@ -27,6 +29,12 @@ import org.apache.gravitino.annotation.Evolving;
  * enumeration of protocol types and does not validate the value. The optional {@code agentCardUrl}
  * points at a protocol descriptor (for example an A2A agent card) but Gravitino does not fetch or
  * interpret it.
+ *
+ * <p>{@link #properties()} is an optional per-protocol extension slot (e.g. {@code auth}, {@code
+ * preferredTransport}, {@code version}). Gravitino does not interpret these keys; they are stored
+ * verbatim and surfaced to consumers as-is. The scope is intentionally narrower than the
+ * agent-level {@link Agent#properties()} map: per-agent keys cover whole-agent operations (e.g.
+ * rate limits), while per-protocol keys cover protocol-connection details.
  */
 @Evolving
 public interface AgentProtocol {
@@ -41,4 +49,15 @@ public interface AgentProtocol {
    */
   @Nullable
   String agentCardUrl();
+
+  /**
+   * @return Optional per-protocol metadata. Returns an empty map if no protocol-level properties
+   *     are set; callers should not depend on a {@code null} return. The scope is intentionally
+   *     narrower than {@link Agent#properties()}: this map covers protocol-connection details such
+   *     as authentication scheme or transport hints, while the agent-level map covers whole-agent
+   *     operations.
+   */
+  default Map<String, String> properties() {
+    return Collections.emptyMap();
+  }
 }
