@@ -80,6 +80,11 @@ public class TestMetadataObjectUtil {
         Entity.EntityType.VIEW,
         MetadataObjectUtil.toEntityType(
             MetadataObjects.of("catalog.schema", "view", MetadataObject.Type.VIEW)));
+
+    Assertions.assertEquals(
+        Entity.EntityType.AGENT,
+        MetadataObjectUtil.toEntityType(
+            MetadataObjects.of("catalog.schema", "agent", MetadataObject.Type.AGENT)));
   }
 
   @Test
