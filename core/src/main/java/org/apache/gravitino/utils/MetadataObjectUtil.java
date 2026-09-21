@@ -64,6 +64,7 @@ public class MetadataObjectUtil {
           .put(MetadataObject.Type.JOB, Entity.EntityType.JOB)
           .put(MetadataObject.Type.VIEW, Entity.EntityType.VIEW)
           .put(MetadataObject.Type.FUNCTION, Entity.EntityType.FUNCTION)
+          .put(MetadataObject.Type.AGENT, Entity.EntityType.AGENT)
           .build();
 
   private MetadataObjectUtil() {}
@@ -134,6 +135,7 @@ public class MetadataObjectUtil {
       case COLUMN:
       case MODEL:
       case FUNCTION:
+      case AGENT:
         String fullName = DOT.join(metalakeName, metadataObject.fullName());
         return NameIdentifier.parse(fullName);
       default:
