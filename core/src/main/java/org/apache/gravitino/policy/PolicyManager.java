@@ -63,7 +63,8 @@ public class PolicyManager implements PolicyDispatcher {
           MetadataObject.Type.TABLE,
           MetadataObject.Type.FILESET,
           MetadataObject.Type.TOPIC,
-          MetadataObject.Type.MODEL);
+          MetadataObject.Type.MODEL,
+          MetadataObject.Type.AGENT);
 
   private final IdGenerator idGenerator;
   private final EntityStore entityStore;

@@ -87,6 +87,42 @@ public class TestMetadataObjectUtil {
             MetadataObjects.of("catalog.schema", "agent", MetadataObject.Type.AGENT)));
   }
 
+  /**
+   * Reflectively read the SUPPORTED_METADATA_OBJECT_TYPES_FOR_TAGS / _FOR_POLICIES sets on {@link
+   * org.apache.gravitino.tag.TagManager} and {@link org.apache.gravitino.policy.PolicyManager} and
+   * assert that AGENT is included. This is the layer Phase 3 Subtask #3 was supposed to verify
+   * end-to-end: associate a Tag or Policy to an Agent. The static-set guard is what throws
+   * IllegalArgumentException before the actual tag/policy table is touched, so this test catches
+   * the latent "add MetadataObject.Type.AGENT but forget to whitelist it everywhere" bug without
+   * standing up a GravitinoEnv.
+   */
+  @Test
+  public void testTagAndPolicyManagersIncludeAgent() throws Exception {
+    java.lang.reflect.Field tagSetField =
+        Class.forName("org.apache.gravitino.tag.TagManager")
+            .getDeclaredField("SUPPORTED_METADATA_OBJECT_TYPES_FOR_TAGS");
+    tagSetField.setAccessible(true);
+    @SuppressWarnings("unchecked")
+    java.util.Set<MetadataObject.Type> tagSet =
+        (java.util.Set<MetadataObject.Type>) tagSetField.get(null);
+    Assertions.assertTrue(
+        tagSet.contains(MetadataObject.Type.AGENT),
+        "TagManager.SUPPORTED_METADATA_OBJECT_TYPES_FOR_TAGS must include AGENT, otherwise "
+            + "associateTagsForMetadataObject on an Agent throws IllegalArgumentException");
+
+    java.lang.reflect.Field policySetField =
+        Class.forName("org.apache.gravitino.policy.PolicyManager")
+            .getDeclaredField("SUPPORTED_METADATA_OBJECT_TYPES_FOR_POLICIES");
+    policySetField.setAccessible(true);
+    @SuppressWarnings("unchecked")
+    java.util.Set<MetadataObject.Type> policySet =
+        (java.util.Set<MetadataObject.Type>) policySetField.get(null);
+    Assertions.assertTrue(
+        policySet.contains(MetadataObject.Type.AGENT),
+        "PolicyManager.SUPPORTED_METADATA_OBJECT_TYPES_FOR_POLICIES must include AGENT, "
+            + "otherwise associatePoliciesForMetadataObject on an Agent throws IllegalArgumentException");
+  }
+
   @Test
   public void testToEntityIdent() {
     Assertions.assertThrows(

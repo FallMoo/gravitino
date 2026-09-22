@@ -277,6 +277,11 @@ public class MetadataObjectUtil {
         check(env.functionDispatcher().functionExists(identifier), exceptionToThrowSupplier);
         break;
 
+      case AGENT:
+        NameIdentifierUtil.checkAgent(identifier);
+        check(env.agentDispatcher().agentExists(identifier), exceptionToThrowSupplier);
+        break;
+
       case VIEW:
         NameIdentifierUtil.checkView(identifier);
         check(env.viewDispatcher().viewExists(identifier), exceptionToThrowSupplier);
