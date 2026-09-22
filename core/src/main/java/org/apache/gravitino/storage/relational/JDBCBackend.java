@@ -42,6 +42,7 @@ import org.apache.gravitino.RelationalEntity;
 import org.apache.gravitino.SupportsRelationOperations;
 import org.apache.gravitino.UnsupportedEntityTypeException;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
+import org.apache.gravitino.meta.AgentEntity;
 import org.apache.gravitino.meta.BaseMetalake;
 import org.apache.gravitino.meta.CatalogEntity;
 import org.apache.gravitino.meta.FilesetEntity;
@@ -209,6 +210,8 @@ public class JDBCBackend implements RelationalBackend {
       ModelVersionMetaService.getInstance().insertModelVersion((ModelVersionEntity) e);
     } else if (e instanceof FunctionEntity) {
       FunctionMetaService.getInstance().insertFunction((FunctionEntity) e, overwritten);
+    } else if (e instanceof AgentEntity) {
+      AgentMetaService.getInstance().insertAgent((AgentEntity) e, overwritten);
     } else if (e instanceof PolicyEntity) {
       PolicyMetaService.getInstance().insertPolicy((PolicyEntity) e, overwritten);
     } else if (e instanceof JobTemplateEntity) {
