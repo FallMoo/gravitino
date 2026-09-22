@@ -96,6 +96,15 @@ public class MetadataObjectService {
                   MetadataObjectService::getJobTemplateObjectsFullName)
               .build();
 
+  // TODO(agent-asset): TYPE_TO_STORAGE_OPS_MAP and TYPE_TO_FULLNAME_FUNCTION_MAP need
+  // AGENT entries to support the reverse query path
+  // (TagManager.listMetadataObjectsForTag on an Agent, see design doc §6 'real lessons learned').
+  // This requires AgentPOStorageOps (parallel to FunctionPOStorageOps / TablePOStorageOps), which
+  // is Phase 2 Subtask #7 (ManagedAgentOperations + EntityStore wiring via PO storage ops).
+  // Until AgentPOStorageOps exists, GET /api/metalakes/{m}/tags/{tag}/objects for an Agent will
+  // NPE at MetadataObjectService.java:202 because TYPE_TO_FULLNAME_FUNCTION_MAP.get(AGENT)
+  // returns null. A workaround is not possible without the AgentPOStorageOps; the forward path
+  // (associateTagsForMetadataObject on an Agent) IS fixed and tested.
   static final Map<MetadataObject.Type, BasePOStorageOps<?, ?>> TYPE_TO_STORAGE_OPS_MAP =
       ImmutableMap.<MetadataObject.Type, BasePOStorageOps<?, ?>>builder()
           .put(MetadataObject.Type.SCHEMA, SchemaMetaService.getInstance().ops())

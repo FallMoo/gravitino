@@ -63,6 +63,7 @@ final class JcasbinAuthorizationCacheKeys {
       case FILESET:
       case MODEL:
       case FUNCTION:
+      case AGENT:
         appendCatalogSchemasAndLeaf(parts, names, metadataObject.type());
         break;
       default:
