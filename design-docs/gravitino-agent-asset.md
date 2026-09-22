@@ -529,6 +529,18 @@ EventBus → audit-log 监听器、Lineage、自定义
 ### Phase 1：核心 API 与存储
 
 > **Phase 1 验收标准**：除脚本 / DTO / 权限映射这几类纯数据类外，**所有核心类（AgentEntity / AgentPO / AgentPOAgentMetaMapper / AgentMetaService 等）必须在同一 Phase 落地时附带单元测试**，没有测试 = 该 Subtask 不算完成。Phase 1 PR 不接受"Subtask 落地、测试留 Phase 5"的状态。
+>
+> **Phase 1 验收补充：AGENT 在「按 MetadataObject.Type dispatch 的所有 Map / switch」必须显式补齐**。历史教训——Phase 1 #14 给 `MetadataObject.Type.AGENT` 加 enum 后，单测只覆盖 `MetadataObjectUtil.toEntityType`，以下几处独立持有一份 dispatch 表的事实被遗漏，每个都会在生产触发 NPE / IllegalArgumentException：
+>
+> | # | 位置 | 类别 | 修复 commit |
+> |---|---|---|---|
+> | 1 | `JDBCBackend.insert` 的 `instanceof` 链（缺 `AgentEntity` 分支） | Dispatcher (write) | `fd813d46f` |
+> | 2 | `MetadataObjectUtil.checkMetadataObject` switch | Dispatcher (read) | `1b7676949` |
+> | 3 | `TagManager.SUPPORTED_METADATA_OBJECT_TYPES_FOR_TAGS` / `PolicyManager.SUPPORTED_METADATA_OBJECT_TYPES_FOR_POLICIES` 集合 | Whitelist | `1b7676949` |
+> | 4 | `MetadataObjectService.TYPE_TO_FULLNAME_FUNCTION_MAP` 和 `TYPE_TO_STORAGE_OPS_MAP` | Dispatcher (read) | **未修，需要 AgentPOStorageOps（Phase 2 follow-up）** |
+> | 5 | `JcasbinAuthorizationCacheKeys.metadataIdCacheKey` switch | Cache key | `d682e9c02` |
+>
+> Phase 1 PR review checklist：审计 `grep -rn 'MetadataObject.Type\.\|switch.*\.type()' core/ server-common/ server/`，确认新增的 `AGENT` 在每一处 dispatch 表中都被覆盖。**单测覆盖一条路径 ≠ 该类型在所有 dispatch 表中都被加入**——这是个反复验证的家族 bug。
 
 - [ ] 在 `MetadataObject.Type` 枚举加入 `AGENT`，在 `Entity.EntityType` 枚举加入 `AGENT`，并在 `api/MetadataObjects.java` 的 `parent()` switch 加 `case AGENT`（与 `FUNCTION` 共用 SCHEMA 父节点），同时把 `AGENT` 加入 `VALID_THREE_LEVEL_NAME_TYPES` 集合
 - [ ] 在 `api/src/main/java/org/apache/gravitino/agent/` 定义 `Agent`、`AgentProtocol`、`AgentChange`（含 `RenameAgent` / `SetProperty` / `RemoveProperty` / `AddProtocol` / `RemoveProtocol` / `AddCapability` / `RemoveCapability` / `UpdateComment` / `SetOwner` 9 个嵌套 final class 与对应静态工厂方法），参照 `FunctionChange.java`
