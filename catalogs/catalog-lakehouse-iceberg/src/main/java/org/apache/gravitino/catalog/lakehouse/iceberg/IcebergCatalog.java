@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.gravitino.annotation.Evolving;
+import org.apache.gravitino.catalog.lakehouse.iceberg.managed.IcebergManagedCatalogOperations;
 import org.apache.gravitino.catalog.lakehouse.iceberg.managed.IcebergManagedCatalogPrerequisites;
 import org.apache.gravitino.connector.BaseCatalog;
 import org.apache.gravitino.connector.CatalogOperations;
@@ -63,12 +64,20 @@ public class IcebergCatalog extends BaseCatalog<IcebergCatalog> {
    */
   @Override
   protected CatalogOperations newOps(Map<String, String> config) {
-    IcebergCatalogOperations ops = new IcebergCatalogOperations();
-    return ops;
+    if (IcebergCatalogBackendMode.fromProperties(config) == IcebergCatalogBackendMode.MANAGED) {
+      // Managed mode never builds an Iceberg SDK catalog: Gravitino owns the connection and only
+      // borrows the SDK's pure metadata semantics.
+      return new IcebergManagedCatalogOperations();
+    }
+    return new IcebergCatalogOperations();
   }
 
   @Override
   public ViewCatalog asViewCatalog() {
+    if (backendMode() == IcebergCatalogBackendMode.MANAGED) {
+      throw new UnsupportedOperationException(
+          "Iceberg views are not supported by Gravitino-managed Iceberg catalogs yet.");
+    }
     return (ViewCatalog) ops();
   }
 

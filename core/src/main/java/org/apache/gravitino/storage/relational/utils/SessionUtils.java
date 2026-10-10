@@ -20,16 +20,22 @@
 package org.apache.gravitino.storage.relational.utils;
 
 import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import org.apache.gravitino.storage.relational.session.SqlSessions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class provides utility methods to perform database operations with MyBatis mappers in the
  * SqlSession.
  */
 public class SessionUtils {
+
+  private static final Logger LOG = LoggerFactory.getLogger(SessionUtils.class);
+
   private SessionUtils() {}
 
   /**
@@ -139,5 +145,55 @@ public class SessionUtils {
 
   public static void rollbackTransaction() {
     SqlSessions.rollbackAndCloseSqlSession();
+  }
+
+  /**
+   * Commits a transaction that mixes SQL executed directly on {@link #currentConnection()} with
+   * nested MyBatis entity writes.
+   *
+   * <p>This is not the same as {@link #commitTransaction()}: MyBatis only issues a JDBC commit when
+   * the session is dirty, and - more dangerously - {@code JdbcTransaction.close()} resets
+   * auto-commit, which makes the JDBC driver commit any statement that MyBatis did not track (a
+   * plain {@code PreparedStatement} executed on the bound connection, for example). Committing the
+   * JDBC transaction explicitly before closing the session is therefore the only way to get a
+   * well-defined outcome for such a transaction.
+   *
+   * @throws IllegalStateException if no transaction is bound to the current thread
+   * @throws RuntimeException if the JDBC commit fails; the transaction is rolled back first
+   */
+  public static void commitTransactionAndConnection() {
+    Connection connection = SqlSessions.getBoundConnection();
+    if (connection == null) {
+      throw new IllegalStateException(
+          "No Gravitino transaction is bound to the current thread. Call"
+              + " SessionUtils.beginTransaction() first.");
+    }
+    try {
+      connection.commit();
+    } catch (SQLException e) {
+      rollbackTransactionAndConnection();
+      throw new RuntimeException("Failed to commit the Gravitino transaction", e);
+    }
+    commitTransaction();
+  }
+
+  /**
+   * Rolls back a transaction that mixes SQL executed directly on {@link #currentConnection()} with
+   * nested MyBatis entity writes and closes the session.
+   *
+   * <p>See {@link #commitTransactionAndConnection()} for why the JDBC transaction has to be
+   * resolved explicitly instead of relying on {@link #rollbackTransaction()}.
+   */
+  public static void rollbackTransactionAndConnection() {
+    Connection connection = SqlSessions.getBoundConnection();
+    if (connection != null) {
+      try {
+        connection.rollback();
+      } catch (SQLException e) {
+        // The session cleanup below must still happen; the caller is already handling a failure.
+        LOG.warn("Failed to roll back the Gravitino transaction bound to the current thread", e);
+      }
+    }
+    rollbackTransaction();
   }
 }

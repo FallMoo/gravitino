@@ -303,7 +303,7 @@ for (UpdateTableRequest change : changes) {
         └──────────────────┬───────────────────────┘
                            ▼
         ┌──────────────────────────────────────────────┐
-        │  ManagedIcebergCatalogOperations             │
+        │  IcebergManagedCatalogOperations             │
         │  写路径原语：create / alter(commit) / drop /   │
         │             rename / register                │
         │                                              │
@@ -584,12 +584,13 @@ boolean persisted = false;
 try {
   // 2. 一个事务覆盖两行
   SessionUtils.beginTransaction();                   // 将 SqlSession + Connection 绑定到当前线程
-  metadataStore.insertOrUpdateIcebergTableRow(...);   // Gravitino SQL
+  metadataStore.insertOrUpdateIcebergTableRow(...);   // Gravitino SQL，直接跑在绑定连接上
   entityStore.put(tableEntity, /* overwrite */ true); // table_meta，嵌套 session，同一条连接
-  SessionUtils.commitTransaction();
+  // 必须显式提交 JDBC 事务，不能只用 SessionUtils.commitTransaction()，理由见下
+  SessionUtils.commitTransactionAndConnection();
   persisted = true;
 } catch (Throwable t) {
-  SessionUtils.rollbackTransaction();
+  SessionUtils.rollbackTransactionAndConnection();
   throw t;
 } finally {
   // 3. 持久化失败时兜底删除刚写的文件（采纳 Polaris 的做法，见 §4.5.4）
@@ -604,6 +605,13 @@ try {
 
 嵌套之所以可行，是因为 `SqlSessions` 是 thread-local 且**引用计数**的：`handleSessionClose` 只在计数归零时才 commit（`SqlSessions.java:106-138`）。因此 `TableMetaService.insertTable` 内部嵌套的 `SessionUtils.doMultipleWithCommit` 会把提交推迟到外层边界，一次 `commit()` 覆盖 `iceberg_tables`、`table_meta`、`table_version` 和 `table_column_version_info`。
 
+**必须显式提交/回滚 JDBC 事务（实施阶段实测发现的硬约束）。** 仅用 `SessionUtils.commitTransaction()` / `rollbackTransaction()` 覆盖"原生 JDBC + 嵌套 MyBatis 写入"的混合事务是**错的**，原因是 MyBatis 的两条实现细节：
+
+1. `DefaultSqlSession.rollback()` 只对**脏** session 才真正调用 `Transaction.rollback()`；直接跑在绑定连接上的 `PreparedStatement` 不会被 MyBatis 记为 dirty，于是回滚被静默跳过；
+2. `JdbcTransaction.close()` 会把连接的 autoCommit 复位为 `true`，而多数 JDBC 驱动（含 H2/MySQL）在 `setAutoCommit(true)` 时会**隐式提交**当前未提交事务 —— 也就是把那条未被追踪的原生 SQL 提交掉。
+
+净效果：`beginTransaction()` → 原生 SQL →（实体写入失败）→ `rollbackTransaction()` 之后，`iceberg_tables` 行会**残留**。因此 core 增加了 `SessionUtils.commitTransactionAndConnection()` / `rollbackTransactionAndConnection()`：先在绑定连接上显式 `commit()`/`rollback()`，再走原有的引用计数收尾。任何"原生 SQL + 实体写入"混用的事务（§5.8、§5.9.1、§5.11）都必须用它，并有回归测试锁定（`TestIcebergManagedCatalogOperations#testRawSqlOnTheSessionConnectionNeedsAnExplicitResolution`）。
+
 由此带来的后果：
 
 * **正常情况下不再有孤儿 metadata 文件**：回滚后由上面的 `finally` 兜底删除。只有"删除本身也失败"（对象存储不可用、权限不足）时才会残留，属于低概率情形，仍由 §7 R7 的维护任务兜底。反向顺序（行已提交、文件缺失）永不产生。
@@ -617,14 +625,14 @@ try {
 #### 5.8.1 createTable
 
 ```
-ManagedIcebergCatalogOperations.createTable(ident, columns, comment, properties, partitions, ...)
+IcebergManagedCatalogOperations.createTable(ident, columns, comment, properties, partitions, ...)
   ├─ 校验 schema 存在（entity store）
   ├─ md = TableMetadata.newTableMetadata(schema, spec, sortOrder, location, properties)   // SDK，纯函数
   ├─ location = writeMetadata(md, 0)   // 与 Iceberg 一致：首个元数据文件是版本 0         // SDK，文件 I/O
   ├─ SessionUtils.beginTransaction()
   │    ├─ INSERT INTO iceberg_tables (..., metadata_location = location, ..., 'TABLE')     // 0 行 → CommitFailedException
   │    └─ super.createTable(...)  → store.put(TableEntity)                                 // 嵌套 session
-  └─ SessionUtils.commitTransaction()
+  └─ SessionUtils.commitTransactionAndConnection()   // 见 §5.7
 ```
 
 Gravitino native 入口下，由于 capability 声明了 managed storage，`TableOperationDispatcher` 不会再写 entity。
@@ -647,7 +655,7 @@ Gravitino native 入口传入的是 `TableChange[]`。映射逻辑是 Gravitino 
   │    │         previous_metadata_location = currentLocation
   │    │   WHERE ... AND metadata_location = currentLocation                              // 0 行 → CommitFailedException
   │    └─ store.update(TableEntity)                                                       // 嵌套 session
-  └─ SessionUtils.commitTransaction()
+  └─ SessionUtils.commitTransactionAndConnection()   // 见 §5.7
 ```
 
 Iceberg REST 入口传入的是 `UpdateTableRequest`（requirements + updates），走 §5.9.1 的翻译，落到同一个原语。两者的差异见 §5.9.3。
@@ -661,7 +669,7 @@ Iceberg REST 入口传入的是 `UpdateTableRequest`（requirements + updates）
   ├─ SessionUtils.beginTransaction()
   │    ├─ DELETE FROM iceberg_tables WHERE ...                                            // 0 行 → 返回 false
   │    └─ store.delete(ident, TABLE)                                                      // 嵌套 session
-  └─ SessionUtils.commitTransaction()
+  └─ SessionUtils.commitTransactionAndConnection()   // 见 §5.7
 ```
 
 #### 5.8.4 renameTable
@@ -694,7 +702,7 @@ ManagedIcebergCommitHandler.commit(ident, UpdateTableRequest request)
   │         SessionUtils.beginTransaction()                            //   结构与属性变更
   │           ├─ UPDATE iceberg_tables ...                             //   0 行 → CommitFailedException
   │           └─ store.update(TableEntity)                             //   嵌套 session
-  │         SessionUtils.commitTransaction()
+  │         SessionUtils.commitTransactionAndConnection()  // 见 §5.7
   │       else
   │         UPDATE iceberg_tables ...                                  //   仅数据版本变更，单条 SQL
   └─ 返回更新后的 TableMetadata
@@ -862,7 +870,7 @@ managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamesp
 
 **第二阶段 —— 写路径原语**
 
-* `ManagedIcebergCatalogOperations` 实现 §5.8 的五个原语，包含 §5.7 的事务边界与 entity 写入。
+* `IcebergManagedCatalogOperations` 实现 §5.8 的五个原语，包含 §5.7 的事务边界与 entity 写入。
 * 集成测试 5、6。
 
 **第三阶段 —— Iceberg REST 入口（主要交付目标）**

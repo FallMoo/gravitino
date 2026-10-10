@@ -1,0 +1,504 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.gravitino.catalog.lakehouse.iceberg.managed;
+
+import static org.apache.gravitino.Configs.CACHE_ENABLED;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.google.common.collect.ImmutableMap;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.reflect.FieldUtils;
+import org.apache.gravitino.Catalog;
+import org.apache.gravitino.Config;
+import org.apache.gravitino.Configs;
+import org.apache.gravitino.Entity;
+import org.apache.gravitino.GravitinoEnv;
+import org.apache.gravitino.HasIdentifier;
+import org.apache.gravitino.NameIdentifier;
+import org.apache.gravitino.Namespace;
+import org.apache.gravitino.SchemaChange;
+import org.apache.gravitino.cache.NoOpsCache;
+import org.apache.gravitino.catalog.CatalogManager;
+import org.apache.gravitino.catalog.SchemaDispatcher;
+import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergConstants;
+import org.apache.gravitino.exceptions.NoSuchTableException;
+import org.apache.gravitino.meta.AuditInfo;
+import org.apache.gravitino.meta.BaseMetalake;
+import org.apache.gravitino.meta.CatalogEntity;
+import org.apache.gravitino.meta.SchemaEntity;
+import org.apache.gravitino.meta.SchemaVersion;
+import org.apache.gravitino.meta.TableEntity;
+import org.apache.gravitino.rel.Column;
+import org.apache.gravitino.rel.Table;
+import org.apache.gravitino.rel.expressions.transforms.Transform;
+import org.apache.gravitino.rel.types.Types;
+import org.apache.gravitino.storage.RandomIdGenerator;
+import org.apache.gravitino.storage.relational.EntityChangeLogPoller;
+import org.apache.gravitino.storage.relational.JDBCBackend;
+import org.apache.gravitino.storage.relational.RelationalEntityStore;
+import org.apache.gravitino.storage.relational.RelationalEntityStoreIdResolver;
+import org.apache.gravitino.storage.relational.service.EntityIdService;
+import org.apache.gravitino.storage.relational.session.SqlSessionFactoryHelper;
+import org.apache.gravitino.utils.NamespaceUtil;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.types.Types.NestedField;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+
+/**
+ * Integration tests for the managed write path (design doc section 8, tests 5 and 6 plus the
+ * surrounding primitives).
+ *
+ * <p>They run a real H2 entity store, a real {@code RelationalEntityStore} (with a fault injector
+ * on the table entity write) and a real {@link IcebergManagedCatalogOperations} on a local
+ * warehouse, so the atomicity claim is exercised end to end instead of being mocked away.
+ */
+public class TestIcebergManagedCatalogOperations {
+
+  private static final String METALAKE = "managed_metalake";
+  private static final String CATALOG = "managed_catalog";
+  private static final String SCHEMA = "db";
+  private static final String ICEBERG_CATALOG_NAME = "managed-iceberg-catalog";
+
+  private static Path entityDbDir;
+  private static Path warehouseDir;
+  private static Config config;
+  private static JDBCBackend backend;
+  private static FailingTableEntityStore store;
+  private static String entityJdbcUrl;
+
+  private static final class FailingTableEntityStore extends RelationalEntityStore {
+    private final AtomicBoolean failTablePuts = new AtomicBoolean(false);
+
+    private void failTablePuts(boolean fail) {
+      failTablePuts.set(fail);
+    }
+
+    @Override
+    public <E extends Entity & HasIdentifier> void put(E e, boolean overwritten)
+        throws IOException {
+      if (e instanceof TableEntity && failTablePuts.get()) {
+        throw new IOException("injected table_meta write failure");
+      }
+      super.put(e, overwritten);
+    }
+  }
+
+  @BeforeAll
+  public static void setUp() throws Exception {
+    entityDbDir = Files.createTempDirectory("gravitino-managed-ops-entity-");
+    warehouseDir = Files.createTempDirectory("gravitino-managed-ops-warehouse-");
+    entityJdbcUrl =
+        String.format("jdbc:h2:file:%s/entity;DB_CLOSE_DELAY=-1;MODE=MYSQL", entityDbDir);
+
+    config = Mockito.mock(Config.class);
+    Mockito.when(config.get(Configs.ENTITY_STORE)).thenReturn(Configs.RELATIONAL_ENTITY_STORE);
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_STORE))
+        .thenReturn(Configs.DEFAULT_ENTITY_RELATIONAL_STORE);
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_JDBC_BACKEND_URL)).thenReturn(entityJdbcUrl);
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_JDBC_BACKEND_USER)).thenReturn("root");
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_JDBC_BACKEND_PASSWORD)).thenReturn("123");
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_JDBC_BACKEND_DRIVER))
+        .thenReturn("org.h2.Driver");
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_JDBC_BACKEND_MAX_CONNECTIONS)).thenReturn(20);
+    Mockito.when(config.get(Configs.ENTITY_RELATIONAL_JDBC_BACKEND_WAIT_MILLISECONDS))
+        .thenReturn(10_000L);
+    Mockito.when(config.get(CACHE_ENABLED)).thenReturn(false);
+
+    SqlSessionFactoryHelper.getInstance().close();
+    GravitinoEnv env = GravitinoEnv.getInstance();
+    FieldUtils.writeField(env, "config", config, true);
+    FieldUtils.writeField(env, "idGenerator", RandomIdGenerator.INSTANCE, true);
+
+    backend = new JDBCBackend();
+    backend.initialize(config);
+    EntityIdService.initialize(new RelationalEntityStoreIdResolver());
+
+    store = new FailingTableEntityStore();
+    FieldUtils.writeField(store, "backend", backend, true);
+    FieldUtils.writeField(store, "cache", new NoOpsCache(config), true);
+    FieldUtils.writeField(
+        store, "entityChangeLogPoller", Mockito.mock(EntityChangeLogPoller.class), true);
+    FieldUtils.writeField(env, "entityStore", store, true);
+    FieldUtils.writeField(env, "catalogManager", Mockito.mock(CatalogManager.class), true);
+    FieldUtils.writeField(
+        env, "internalSchemaDispatcher", new AlwaysExistingSchemaDispatcher(), true);
+
+    // The Iceberg V1 tables live in the same database as the Gravitino entities.
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123")) {
+      connection.setAutoCommit(true);
+      ManagedIcebergMetadataStore.createIcebergTablesIfNotExists(connection);
+    }
+  }
+
+  @AfterAll
+  public static void tearDown() throws Exception {
+    if (backend != null) {
+      backend.close();
+    }
+    FileUtils.deleteDirectory(entityDbDir.toFile());
+    FileUtils.deleteDirectory(warehouseDir.toFile());
+  }
+
+  private static IcebergManagedCatalogOperations newOps() {
+    Map<String, String> conf =
+        ImmutableMap.<String, String>builder()
+            .put(IcebergConstants.CATALOG_BACKEND_MODE, "managed")
+            .put(IcebergConstants.CATALOG_BACKEND, "jdbc")
+            .put(IcebergConstants.WAREHOUSE, warehouseDir.toUri().toString())
+            .put(IcebergConstants.CATALOG_BACKEND_NAME, ICEBERG_CATALOG_NAME)
+            .build();
+    IcebergManagedCatalogOperations ops = new IcebergManagedCatalogOperations();
+    ops.initialize(conf, null, null);
+    return ops;
+  }
+
+  /** A schema dispatcher that reports every schema as existing, so the entity-store focus holds. */
+  private static final class AlwaysExistingSchemaDispatcher implements SchemaDispatcher {
+    @Override
+    public NameIdentifier[] listSchemas(Namespace namespace) {
+      return new NameIdentifier[0];
+    }
+
+    @Override
+    public org.apache.gravitino.Schema loadSchema(NameIdentifier ident) {
+      return Mockito.mock(org.apache.gravitino.Schema.class);
+    }
+
+    @Override
+    public org.apache.gravitino.Schema createSchema(
+        NameIdentifier ident, String comment, Map<String, String> properties) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public org.apache.gravitino.Schema alterSchema(NameIdentifier ident, SchemaChange... changes) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public boolean dropSchema(NameIdentifier ident, boolean cascade) {
+      throw new UnsupportedOperationException();
+    }
+  }
+
+  @BeforeEach
+  public void resetState() throws Exception {
+    store.failTablePuts(false);
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
+        Statement statement = connection.createStatement()) {
+      statement.execute("DELETE FROM iceberg_tables");
+      statement.execute("DELETE FROM table_meta");
+      statement.execute("DELETE FROM schema_meta");
+      statement.execute("DELETE FROM catalog_meta");
+      statement.execute("DELETE FROM metalake_meta");
+    }
+    // Each test gets a clean warehouse so orphan-file assertions cannot see another test's files.
+    Path warehouseTables = warehouseDir.resolve("db");
+    if (Files.exists(warehouseTables)) {
+      FileUtils.deleteDirectory(warehouseTables.toFile());
+    }
+
+    insertEntity(metalakeEntity());
+    insertEntity(catalogEntity());
+    insertEntity(schemaEntity());
+  }
+
+  private static <E extends Entity & HasIdentifier> void insertEntity(E entity) throws IOException {
+    store.put(entity, false);
+  }
+
+  private static AuditInfo auditInfo() {
+    return AuditInfo.builder().withCreator("test").withCreateTime(Instant.now()).build();
+  }
+
+  private static BaseMetalake metalakeEntity() {
+    return BaseMetalake.builder()
+        .withId(RandomIdGenerator.INSTANCE.nextId())
+        .withName(METALAKE)
+        .withAuditInfo(auditInfo())
+        .withComment("")
+        .withProperties(null)
+        .withVersion(SchemaVersion.V_0_1)
+        .build();
+  }
+
+  private static CatalogEntity catalogEntity() {
+    return CatalogEntity.builder()
+        .withId(RandomIdGenerator.INSTANCE.nextId())
+        .withName(CATALOG)
+        .withNamespace(Namespace.of(METALAKE))
+        .withType(Catalog.Type.RELATIONAL)
+        .withProvider("lakehouse-iceberg")
+        .withComment("")
+        .withProperties(Collections.emptyMap())
+        .withAuditInfo(auditInfo())
+        .build();
+  }
+
+  private static SchemaEntity schemaEntity() {
+    return SchemaEntity.builder()
+        .withId(RandomIdGenerator.INSTANCE.nextId())
+        .withName(SCHEMA)
+        .withNamespace(Namespace.of(METALAKE, CATALOG))
+        .withComment("")
+        .withProperties(null)
+        .withAuditInfo(auditInfo())
+        .build();
+  }
+
+  private static Column[] columns() {
+    return new Column[] {
+      Column.of("id", Types.IntegerType.get(), "id"),
+      Column.of("data", Types.StringType.get(), "data")
+    };
+  }
+
+  private static NameIdentifier tableIdent(String name) {
+    return NameIdentifier.of(NamespaceUtil.ofTable(METALAKE, CATALOG, SCHEMA), name);
+  }
+
+  private static long countIcebergRows(String tableName) throws SQLException {
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
+        Statement statement = connection.createStatement();
+        ResultSet rs =
+            statement.executeQuery(
+                String.format(
+                    "SELECT COUNT(*) FROM iceberg_tables WHERE table_name = '%s'", tableName))) {
+      return rs.next() ? rs.getLong(1) : -1L;
+    }
+  }
+
+  private static long countTableMetaRows(String tableName) throws SQLException {
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
+        Statement statement = connection.createStatement();
+        ResultSet rs =
+            statement.executeQuery(
+                String.format(
+                    "SELECT COUNT(*) FROM table_meta WHERE table_name = '%s' AND deleted_at = 0",
+                    tableName))) {
+      return rs.next() ? rs.getLong(1) : -1L;
+    }
+  }
+
+  private static Optional<String> selectMetadataLocation(String tableName) throws SQLException {
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
+        Statement statement = connection.createStatement();
+        ResultSet rs =
+            statement.executeQuery(
+                String.format(
+                    "SELECT metadata_location FROM iceberg_tables WHERE table_name = '%s'",
+                    tableName))) {
+      return rs.next() ? Optional.ofNullable(rs.getString(1)) : Optional.empty();
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testRawSqlOnTheSessionConnectionNeedsAnExplicitResolution() throws Exception {
+    // Platform behaviour that the managed write path has to work around: MyBatis only issues a
+    // JDBC rollback for a session it considers dirty, and JdbcTransaction.close() resets
+    // auto-commit, which makes the driver commit a statement it never tracked.
+    org.apache.gravitino.storage.relational.utils.SessionUtils.beginTransaction();
+    java.sql.Connection connection =
+        org.apache.gravitino.storage.relational.utils.SessionUtils.currentConnection();
+    insertRawRow(connection, "t_mybatis_close");
+    org.apache.gravitino.storage.relational.utils.SessionUtils.rollbackTransaction();
+    assertEquals(
+        1L,
+        countIcebergRows("t_mybatis_close"),
+        "the pitfall disappeared: MyBatis now rolls back untracked statements itself");
+
+    // Resolving the JDBC transaction explicitly gives the expected outcome.
+    org.apache.gravitino.storage.relational.utils.SessionUtils.beginTransaction();
+    java.sql.Connection explicit =
+        org.apache.gravitino.storage.relational.utils.SessionUtils.currentConnection();
+    insertRawRow(explicit, "t_explicit_rollback");
+    org.apache.gravitino.storage.relational.utils.SessionUtils.rollbackTransactionAndConnection();
+    assertEquals(0L, countIcebergRows("t_explicit_rollback"));
+
+    // And the explicit commit makes both a raw statement and a nested entity write durable.
+    org.apache.gravitino.storage.relational.utils.SessionUtils.beginTransaction();
+    insertRawRow(
+        org.apache.gravitino.storage.relational.utils.SessionUtils.currentConnection(),
+        "t_explicit_commit");
+    org.apache.gravitino.storage.relational.utils.SessionUtils.commitTransactionAndConnection();
+    assertEquals(1L, countIcebergRows("t_explicit_commit"));
+  }
+
+  private static void insertRawRow(java.sql.Connection connection, String tableName)
+      throws SQLException {
+    try (java.sql.PreparedStatement ps =
+        connection.prepareStatement(
+            "INSERT INTO iceberg_tables (catalog_name, table_namespace, table_name,"
+                + " metadata_location, previous_metadata_location, iceberg_type)"
+                + " VALUES (?, 'db', ?, 'loc1', NULL, 'TABLE')")) {
+      ps.setString(1, ICEBERG_CATALOG_NAME);
+      ps.setString(2, tableName);
+      ps.executeUpdate();
+    }
+  }
+
+  @Test
+  public void testCreateTableWritesThePointerAndTheEntityTogether() throws Exception {
+    IcebergManagedCatalogOperations ops = newOps();
+    NameIdentifier ident = tableIdent("t_success");
+
+    Table table =
+        ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    assertNotNull(table);
+    assertEquals("t_success", table.name());
+    assertEquals(2, table.columns().length);
+
+    assertEquals(1L, countIcebergRows("t_success"), "the iceberg_tables row is missing");
+    assertEquals(1L, countTableMetaRows("t_success"), "the table_meta row is missing");
+
+    String metadataLocation = selectMetadataLocation("t_success").orElseThrow();
+    assertEquals(
+        0,
+        ManagedIcebergMetadataStore.parseVersion(metadataLocation),
+        "the first metadata file must be version 0: " + metadataLocation);
+
+    // The read path resolves the table from the metadata file.
+    Table loaded = ops.loadTable(ident);
+    assertEquals(2, loaded.columns().length);
+    assertEquals(1, ops.listTables(NamespaceUtil.ofTable(METALAKE, CATALOG, SCHEMA)).length);
+    assertTrue(ops.tableExists(ident));
+  }
+
+  /**
+   * Design doc test 5/6 (inverted): when the Gravitino entity write fails, managed mode must leave
+   * no {@code iceberg_tables} row behind, must surface the failure, and must not leave a metadata
+   * file that nobody references. This is exactly the federated defect the design removes.
+   */
+  @Test
+  public void testCreateTableRollsTheIcebergRowBackWhenTheEntityWriteFails() throws Exception {
+    IcebergManagedCatalogOperations ops = newOps();
+    NameIdentifier ident = tableIdent("t_failure");
+
+    store.failTablePuts(true);
+    RuntimeException failure =
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                ops.createTable(
+                    ident, columns(), "spike", Collections.emptyMap(), new Transform[0]));
+    assertTrue(
+        String.valueOf(failure.getMessage()).contains("Failed to create table")
+            || String.valueOf(failure.getCause()).contains("injected"),
+        "the failure must be surfaced, got: " + failure);
+
+    assertEquals(0L, countIcebergRows("t_failure"), "the iceberg_tables row was not rolled back");
+    assertEquals(0L, countTableMetaRows("t_failure"), "the table_meta row exists");
+
+    // The failure is honest: the table does not exist.
+    assertThrows(NoSuchTableException.class, () -> ops.loadTable(ident));
+    assertFalse(ops.tableExists(ident));
+
+    // No orphan metadata file (design doc section 5.7): the warehouse only has empty directories.
+    try (Stream<Path> paths = Files.walk(warehouseDir)) {
+      assertTrue(
+          paths.noneMatch(p -> p.toString().endsWith(".metadata.json")),
+          "an orphan metadata file was left behind");
+    }
+  }
+
+  @Test
+  public void testCommitAdvancesThePointerAndTheEntity() throws Exception {
+    IcebergManagedCatalogOperations ops = newOps();
+    NameIdentifier ident = tableIdent("t_commit");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    TableMetadata base =
+        TableMetadataParser.read(
+            new HadoopFileIO(new Configuration()),
+            selectMetadataLocation("t_commit").orElseThrow());
+    Schema newSchema =
+        new Schema(
+            NestedField.required(1, "id", org.apache.iceberg.types.Types.IntegerType.get()),
+            NestedField.required(2, "data", org.apache.iceberg.types.Types.StringType.get()),
+            NestedField.optional(3, "extra", org.apache.iceberg.types.Types.StringType.get()));
+    TableMetadata updated = base.updateSchema(newSchema);
+
+    Table committed = ops.commit(ident, base, updated);
+    assertEquals(3, committed.columns().length);
+
+    String newLocation = selectMetadataLocation("t_commit").orElseThrow();
+    assertEquals(
+        1, ManagedIcebergMetadataStore.parseVersion(newLocation), "the version did not advance");
+    assertEquals(1L, countTableMetaRows("t_commit"));
+
+    // Committing against the stale base must fail and must not move the pointer.
+    org.apache.iceberg.exceptions.CommitFailedException e =
+        assertThrows(
+            org.apache.iceberg.exceptions.CommitFailedException.class,
+            () -> ops.commit(ident, base, updated));
+    assertTrue(e.getMessage().contains("concurrently"), e.getMessage());
+    assertEquals(newLocation, selectMetadataLocation("t_commit").orElseThrow());
+  }
+
+  @Test
+  public void testDropAndRenameMoveBothStores() throws Exception {
+    IcebergManagedCatalogOperations ops = newOps();
+    NameIdentifier ident = tableIdent("t_dropme");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    assertTrue(ops.renameTable(ident, tableIdent("t_renamed")));
+    assertEquals(0L, countIcebergRows("t_dropme"));
+    assertEquals(1L, countIcebergRows("t_renamed"));
+    assertEquals(0L, countTableMetaRows("t_dropme"));
+    assertEquals(1L, countTableMetaRows("t_renamed"));
+
+    assertTrue(ops.dropTable(tableIdent("t_renamed")));
+    assertEquals(0L, countIcebergRows("t_renamed"));
+    assertEquals(0L, countTableMetaRows("t_renamed"));
+    assertThrows(NoSuchTableException.class, () -> ops.loadTable(tableIdent("t_renamed")));
+    assertFalse(
+        ops.dropTable(tableIdent("t_renamed")), "dropping a missing table must return false");
+    assertNull(selectMetadataLocation("t_renamed").orElse(null));
+  }
+}
