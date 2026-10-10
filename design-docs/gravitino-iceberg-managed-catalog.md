@@ -198,6 +198,8 @@ taskOps.commit(base, updated);                                               // 
 * **重试**：`CatalogHandlers.commit` 用 `Tasks.foreach(ops).retry(COMMIT_NUM_RETRIES_DEFAULT).onlyRetryOn(CommitFailedException.class)` 做指数退避重试 —— SQL 乐观并发失败（0 行）时重新读 base、重新校验、重新应用 updates、重新写文件、重试 UPDATE。requirements 校验失败则包成 `ValidationFailureException` 直接返回客户端，不重试。
 * **`isCreate` 分支**：requirements 含 `AssertTableDoesNotExist` 时（`CREATE OR REPLACE TABLE`、以及 staged create 的提交）走的是 `CatalogHandlers.create(ops, request)` 而非 `commit`，同样需要复刻。语义见 §5.9.1。
 
+**"纯调用"的准确边界。** 上述"纯"是指**不提交表元数据、不访问数据库**，并不意味着零 I/O：客户端构造 `AddSnapshot` 载荷时（`AppendFiles.apply()`）会写 data manifest 与 manifest list 文件，这发生在数据提交方（Spark/Flink）一侧，与 Gravitino 无关；Gravitino 侧真正需要落盘的是新版本的元数据 JSON（§5.5）。实施前已对 Iceberg 1.11.0 逐项实证（见 §5.12）。
+
 ### 4.5 与 Apache Polaris 的对照
 
 Apache Polaris 是同类问题最成熟的参考实现 —— 它同样要把"Iceberg 元数据文件 + 自己的元数据存储"绑在一起。对照它有两点价值：**它验证了什么**，以及**它为什么和我们做了不同的选择**。
@@ -717,11 +719,19 @@ ManagedIcebergCommitHandler.commit(ident, UpdateTableRequest request)
 
 **重试循环必须与调用同线程。** `CatalogHandlers.commit` 的重试用 `Tasks.foreach(ops).retry(...).run(...)`；Iceberg 的 `TaskGroup.run(...)` 在未调用 `.executeWith(ExecutorService)` 时走 `runSingleThreaded`（`Tasks.java:199-206`），与调用同线程。
 
-这一点对本设计是**硬约束**：Gravitino 的事务绑定在 `SqlSessions` 的 thread-local 上（§5.7）。一旦重试切到线程池，`beginTransaction()` 绑定的连接就会失效，`iceberg_tables` 与 `table_meta` 会落到不同的连接与事务上 —— 而这正是本设计要消除的问题。因此：
+这一点对本设计是**硬约束**：Gravitino 的事务绑定在 `SqlSessions` 的 thread-local 上（§5.7）。一旦重试切到线程池，`beginTransaction()` 绑定的连接就会失效。因此：
 
 * 自己实现重试循环时必须保持同步、同线程；
 * 若复刻时沿用 `Tasks.foreach(...)`，**不得**添加 `.executeWith(...)`；
 * 用测试锁定（§8 测试 18）。
+
+**约束的准确理由（实施前实证后的修正）。** 上文原稿把后果写成"`iceberg_tables` 与 `table_meta` 会落到不同的连接与事务上"，这在**事务开在重试任务外部**时成立；但按本节伪代码，`beginTransaction()` 实际位于每次尝试**内部**，此时两个 store 都在重试线程自己的 session 上，并不会彼此分裂。线程池真正破坏的是三件事：
+
+1. 调用方可能存在的**外层事务边界**（例如把多个操作合并进一次提交时）；
+2. **跨 attempt 的事务连续性** —— 第 N 次与第 N+1 次尝试可能落在不同线程，上一轮的未提交写入会滞留在别的连接上；
+3. 其它 thread-local 上下文（principal / 请求上下文、`TreeLock` 的持有线程）。
+
+结论不变（不得 `.executeWith`、自研重试也必须同线程），但实现者应按上面三条来评估风险，而不是假设两个 store 一定会分裂。
 
 #### 5.9.2 Gravitino native 入口（第五阶段）
 
@@ -768,6 +778,19 @@ Gravitino 的内存 `LocalTableMetadataCache` 必须在每次写入后失效、�
 
 managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamespaces`（外加命名空间存在性检查 —— Iceberg 的 JDBC 后端是从 `iceberg_tables` 与 `iceberg_namespace_properties` 共同推导命名空间存在性的）。对应的 `SchemaEntity` 由 Gravitino 在同一事务内写入，因为 `managedStorage(SCHEMA)` 同样被声明为 `SUPPORTED`。
 
+### 5.12 实施前置验证结论
+
+本设计的三块地基在**写实现之前**用一次性证伪测试（falsification spike）实测过，结论如下（证据为本地记录，未进入仓库）：
+
+| 假设 | 结论 | 关键证据 |
+| --- | --- | --- |
+| §5.7 一个事务覆盖 `iceberg_tables` + `table_meta`，嵌套实体写入不提前提交 | 成立 | 提交后两行都可见、回滚后两行都不存在、外层提交前外部不可见；负对照（独立连接）回滚后 iceberg 行残留 |
+| §4.4 / §5.4 SDK 可当纯函数库用 | 成立 | 元数据构建/演进零提交、零输出文件；"校验 requirement + 应用 update + build"的复刻产物与 `CatalogHandlers.updateTable` 在 uuid / formatVersion / location / `lastColumnId` / schema·spec·sort id / properties / `currentSnapshotId` / refs / snapshot 数量上一致 |
+| §5.9.1 / R13 重试同线程 | 成立 | `Tasks.foreach(...).run(...)` 3/3 次尝试在同一线程；线程池反例落到另一条连接且调用方提交不覆盖其写入 |
+| §1.2 / §1.3 现状缺陷 | 复现 | `createTable` 返回成功、`iceberg_tables` 有行、`table_meta` 缺行；`loadTable` 自动 import 并抛 `RuntimeException("Fail to import the table entity to the store.")` |
+
+由验证结果修正的两处表述：§4.4 的"纯调用"边界（不含 manifest 写入）、§5.9.1 线程池后果的精确描述。
+
 ---
 
 ## 6. 兼容性与迁移
@@ -796,7 +819,7 @@ managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamesp
 | R10 | **`table_meta` 同步判定需跟随 Iceberg 演进** | §5.9.3 按 `MetadataUpdate` 类型区分"是否影响实体内容"。Iceberg 新增 update 类型时必须重新归类，否则要么漏同步（实体漂移）、要么过度同步（每次数据写入都写 `table_meta`）。建议用白名单 + 单元测试枚举所有 `MetadataUpdate` 子类来防漏。 |
 | R11 | **federated 与 managed 的实体写入语义不同** | managed 模式下实体无条件写入；federated 模式下仍受 `gravitino.authorization.enable` gate 控制。同一个 Iceberg catalog 在两种模式下行为不同是预期内的，但文档和运维手册必须写清楚，否则会被误判为 bug。 |
 | R12 | **去掉授权 gate 的影响面** | 把写路径从 `IcebergTableHookDispatcher` 等 Hook 层移入实现层，会同时影响授权关闭与开启两种配置下的行为（授权开启时不再需要 Hook 重复 import）。需要回归：授权开启时的 owner 设置、list 可见性过滤、以及 `IcebergOrphanSchemaCleanup` 的调用时机。 |
-| R13 | **重试/异步必须保持同线程** | 事务绑定在 `SqlSessions` 的 thread-local 上。`Tasks.foreach(...).run(...)` 默认同线程（`Tasks.java:199-206`），但一旦有人加上 `.executeWith(pool)`，或 Gravitino 自己实现重试时引入线程池，`iceberg_tables` 与 `table_meta` 就会落到不同连接/事务上，本设计的目的即被破坏。需用测试锁定（§8 测试 18）。 |
+| R13 | **重试/异步必须保持同线程** | 事务绑定在 `SqlSessions` 的 thread-local 上。`Tasks.foreach(...).run(...)` 默认同线程（`Tasks.java:199-206`，已实证为 `runSingleThreaded`），但一旦有人加上 `.executeWith(pool)`，或 Gravitino 自己实现重试时引入线程池，事务与 thread-local 上下文就会被破坏。精确后果（而非"两个 store 必然分裂"）见 §5.9.1。需用测试锁定（§8 测试 18）。 |
 
 ## 8. 测试策略
 
