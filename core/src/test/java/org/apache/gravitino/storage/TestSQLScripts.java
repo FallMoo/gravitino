@@ -63,12 +63,21 @@ public class TestSQLScripts extends TestJDBCBackend {
             "(?:iceberg|optimizer)-metrics-schema-([\\d.]+)-"
                 + backendType.toLowerCase()
                 + "\\.sql");
+    // The Iceberg pointer tables of a Gravitino-managed Iceberg catalog live in the same database
+    // as
+    // the entity store. They are created at catalog initialization, and this script is the explicit
+    // alternative when the Gravitino database user cannot run DDL. Validating it here keeps the DDL
+    // executable on every supported backend.
+    Pattern managedIcebergPattern =
+        Pattern.compile(
+            "iceberg-managed-catalog-([\\d.]+)-" + backendType.toLowerCase() + "\\.sql");
 
     Map<String, List<File>> versionScrips = new HashMap<>();
     for (File scriptFile : scriptFiles) {
       Matcher schemaMatcher = schemaPattern.matcher(scriptFile.getName());
       Matcher upgradeMatcher = upgradePattern.matcher(scriptFile.getName());
       Matcher metricsMatcher = metricsPattern.matcher(scriptFile.getName());
+      Matcher managedIcebergMatcher = managedIcebergPattern.matcher(scriptFile.getName());
 
       if (schemaMatcher.matches()) {
         String version = schemaMatcher.group(1);
@@ -81,6 +90,10 @@ public class TestSQLScripts extends TestJDBCBackend {
 
       } else if (metricsMatcher.matches()) {
         String version = metricsMatcher.group(1);
+        versionScrips.computeIfAbsent(version, k -> new ArrayList<>()).add(scriptFile);
+
+      } else if (managedIcebergMatcher.matches()) {
+        String version = managedIcebergMatcher.group(1);
         versionScrips.computeIfAbsent(version, k -> new ArrayList<>()).add(scriptFile);
 
       } else {

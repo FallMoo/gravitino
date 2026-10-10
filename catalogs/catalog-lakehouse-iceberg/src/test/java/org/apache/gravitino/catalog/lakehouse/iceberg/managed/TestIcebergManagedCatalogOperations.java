@@ -528,6 +528,10 @@ public class TestIcebergManagedCatalogOperations {
   private static final class CountingCommitOps extends IcebergManagedCatalogOperations {
     private final AtomicInteger commitAttempts = new AtomicInteger();
     private final AtomicInteger readAttempts = new AtomicInteger();
+    private final java.util.Set<String> attemptThreads =
+        java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
+    private final java.util.List<Integer> sessionCountsAtAttempt =
+        java.util.Collections.synchronizedList(new java.util.ArrayList<>());
     private final boolean failFirstCommit;
     private final boolean alwaysFail;
 
@@ -545,6 +549,12 @@ public class TestIcebergManagedCatalogOperations {
     @Override
     public TableMetadata commit(NameIdentifier ident, TableMetadata base, TableMetadata updated) {
       int attempt = commitAttempts.incrementAndGet();
+      attemptThreads.add(Thread.currentThread().getName());
+      try {
+        sessionCountsAtAttempt.add(sessionCount());
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
       if (alwaysFail) {
         throw new org.apache.iceberg.exceptions.CommitFailedException(
             "simulated permanent concurrent writer");
@@ -957,5 +967,79 @@ public class TestIcebergManagedCatalogOperations {
                     namespace))) {
       return rs.next() ? rs.getLong(1) : -1L;
     }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Cross-entry compatibility and retry thread binding (design tests 7 and 18)
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testNativeIcebergJdbcCatalogReadsWhatManagedModeWrote() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    ops.createTable(namespace, restCreateRequest("t_roundtrip", false));
+
+    // A native Iceberg JdbcCatalog pointed at the same database must see exactly the table managed
+    // mode wrote: this is the round-trip guarantee of the design (test 7).
+    Map<String, String> nativeProperties = new java.util.HashMap<>();
+    nativeProperties.put("uri", entityJdbcUrl);
+    nativeProperties.put("warehouse", warehouseDir.toUri().toString());
+    nativeProperties.put("jdbc.user", "root");
+    nativeProperties.put("jdbc.password", "123");
+    org.apache.iceberg.catalog.Catalog nativeCatalog =
+        org.apache.iceberg.CatalogUtil.loadCatalog(
+            "org.apache.iceberg.jdbc.JdbcCatalog", CATALOG, nativeProperties, null);
+    // JdbcCatalog implements AutoCloseable; the Catalog interface does not expose it.
+    try {
+      org.apache.iceberg.catalog.TableIdentifier identifier =
+          org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_roundtrip");
+      assertTrue(nativeCatalog.tableExists(identifier));
+      org.apache.iceberg.Table nativeTable = nativeCatalog.loadTable(identifier);
+      assertEquals(2, nativeTable.schema().columns().size());
+      assertEquals("spike", nativeTable.properties().get("owner"));
+      assertEquals(
+          ops.metadataLocation(identifier).orElseThrow(),
+          ((org.apache.iceberg.BaseTable) nativeTable)
+              .operations()
+              .current()
+              .metadataFileLocation(),
+          "the native catalog must resolve the same metadata file");
+    } finally {
+      ((AutoCloseable) nativeCatalog).close();
+    }
+  }
+
+  @Test
+  public void testCommitRetriesKeepTheTransactionOffAnyThreadPool() throws Exception {
+    CountingCommitOps ops = newOpsOfType(() -> new CountingCommitOps(true, false));
+    NameIdentifier ident = tableIdent("t_thread_binding");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    TableMetadata base = ops.readMetadata(ident);
+    String callerThread = Thread.currentThread().getName();
+    assertEquals(0, sessionCount(), "no transaction may be bound before the commit");
+
+    new ManagedIcebergCommitHandler(ops)
+        .commit(ident, setPropertyRequest(ident, base, "thread", "bound"));
+
+    // R13: Tasks.foreach(...) without executeWith(...) must run every attempt on the calling
+    // thread,
+    // and the transaction must be released between attempts.
+    assertEquals(
+        java.util.Set.of(callerThread),
+        ops.attemptThreads,
+        "a commit retry escaped to another thread");
+    assertTrue(ops.sessionCountsAtAttempt.stream().allMatch(count -> count <= 1));
+    assertEquals(0, sessionCount(), "the retry loop leaked a bound transaction");
+  }
+
+  /** Reads the reference-counted session count of the Gravitino transaction thread-local. */
+  private static int sessionCount() throws Exception {
+    java.lang.reflect.Method method =
+        Class.forName("org.apache.gravitino.storage.relational.session.SqlSessions")
+            .getDeclaredMethod("getSessionCount");
+    method.setAccessible(true);
+    return (int) method.invoke(null);
   }
 }
