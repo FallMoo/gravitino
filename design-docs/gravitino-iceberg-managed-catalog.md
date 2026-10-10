@@ -414,6 +414,12 @@ IcebergCatalog.newCapability()
 | `TableOperationDispatcher`（改造） | Gravitino native 入口适配器（第五阶段） |
 | `IcebergTableHookDispatcher` 等 Hook 层 | managed 模式下不再承担实体写入（写入移入实现层）；保留授权相关职责 |
 | `IcebergCatalogWrapper` | 契约不变；managed 模式下读写都不再走 Iceberg 的 `JdbcCatalog` 与 `CatalogHandlers` |
+| `ManagedCatalogWrapperForREST`（`iceberg-rest-server`） | `CatalogWrapperForREST` 的 managed 子类：所有表操作委托给 `ManagedIcebergCatalogOps`，永不初始化 Iceberg SDK catalog |
+
+**managed wrapper 的取得方式与 `uri` 的处理（实施阶段补充）。** `IcebergCatalogWrapperManager.createCatalogWrapper` 在 `catalog-backend-mode=managed` 时返回 `ManagedCatalogWrapperForREST`，它通过 `CatalogManager.loadCatalogAndWrap(NameIdentifier.of(metalake, catalogName)).catalog().ops()` 拿到实现层实例（`CatalogManager` 已缓存 catalog，`ops()` 是懒加载），metalake 取自 `IcebergRESTServerContext`。两个实现细节：
+
+* `IcebergCatalogWrapper` 的构造函数原本对非 memory 后端强制要求 `uri`（`IcebergConfig.CATALOG_URI` 带 `checkValue(isNotBlank)`）。managed 模式不需要 `uri`（§5.8 的 `uri` 是可选的），因此构造函数在 managed 模式下跳过该读取；`catalogUri` 只用于 JDBC 驱动清理，为 null 是安全的。
+* managed wrapper 覆盖 `getCatalog()` 直接抛错：managed 模式下任何"顺手拿 SDK catalog"的代码都是 bug，应当立即暴露而不是悄悄连库。
 
 **为什么契约放在 `iceberg-common`。** 实现层在 `catalog-lakehouse-iceberg`，REST 入口在 `iceberg-rest-server`，后者**不依赖**前者（catalogs 是插件，反向依赖会破坏分发层布局）。契约因此放在两者共同依赖的 `iceberg-common`。这里有一个必须留意的细节：`IsolatedClassLoader.isSharedClass` 把 `org.apache.gravitino.catalog.*` 之外的一切都当作 **shared**，委派给 server 的 `baseClassLoader`，所以 `org.apache.gravitino.iceberg.common.ops.ManagedIcebergCatalogOps` 由 server 加载；而实现类落在 `org.apache.gravitino.catalog.lakehouse.iceberg.managed`（隔离加载）。因此跨隔离边界对 `catalog.ops()` 做 `instanceof ManagedIcebergCatalogOps` 是安全的，**但绝不能把契约放在 `org.apache.gravitino.catalog.*` 下**——那会被隔离加载，`instanceof` 永远为 false。
 

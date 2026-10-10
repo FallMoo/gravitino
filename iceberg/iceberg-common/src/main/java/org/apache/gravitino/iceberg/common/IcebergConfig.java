@@ -52,6 +52,15 @@ public class IcebergConfig extends Config implements OverwriteDefaultConfig {
           .stringConf()
           .createWithDefault("memory");
 
+  public static final ConfigEntry<String> CATALOG_BACKEND_MODE =
+      new ConfigBuilder(IcebergConstants.CATALOG_BACKEND_MODE)
+          .doc(
+              "Whether Gravitino owns the Iceberg metadata (`managed`) or the Iceberg catalog "
+                  + "backend owns it (`federated`, the default)")
+          .version(ConfigConstants.VERSION_1_3_0)
+          .stringConf()
+          .createWithDefault("federated");
+
   public static final ConfigEntry<String> CATALOG_BACKEND_IMPL =
       new ConfigBuilder(IcebergConstants.CATALOG_BACKEND_IMPL)
           .doc(

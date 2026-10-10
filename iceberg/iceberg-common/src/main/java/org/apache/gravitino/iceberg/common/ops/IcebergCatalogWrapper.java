@@ -96,11 +96,18 @@ public class IcebergCatalogWrapper implements AutoCloseable {
         throw new IllegalArgumentException("The 'warehouse' parameter must have a value.");
       }
     }
-    if (!IcebergCatalogBackend.MEMORY.equals(catalogBackend)) {
+    if (!IcebergCatalogBackend.MEMORY.equals(catalogBackend)
+        && !isManagedBackendMode(icebergConfig)) {
+      // In managed backend mode Gravitino owns the metadata and this wrapper never loads an Iceberg
+      // SDK catalog, so `uri` is optional and must not be validated here (design doc section 5.3).
       this.catalogUri = icebergConfig.get(IcebergConfig.CATALOG_URI);
     }
     Map<String, String> catalogPropertiesMap = icebergConfig.getIcebergCatalogProperties();
     this.configuration = FileSystemUtils.createConfiguration(null, catalogPropertiesMap);
+  }
+
+  private static boolean isManagedBackendMode(IcebergConfig icebergConfig) {
+    return "managed".equalsIgnoreCase(icebergConfig.get(IcebergConfig.CATALOG_BACKEND_MODE));
   }
 
   public Catalog getCatalog() {

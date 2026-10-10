@@ -145,6 +145,40 @@ public class TestIcebergCatalogWrapperManagerForREST {
     Assertions.assertEquals(CatalogWrapperForREST.class, wrapper.getClass());
   }
 
+  @Test
+  public void testCreateManagedWrapperForManagedBackendMode() {
+    IcebergConfig icebergConfig =
+        new IcebergConfig(
+            ImmutableMap.of(
+                IcebergConstants.CATALOG_BACKEND,
+                "jdbc",
+                IcebergConstants.CATALOG_BACKEND_MODE,
+                "managed",
+                IcebergConstants.WAREHOUSE,
+                "/tmp/managed-wrapper-manager-test"));
+
+    CatalogWrapperForREST wrapper = newManager().createCatalogWrapper("test", icebergConfig);
+
+    Assertions.assertInstanceOf(ManagedCatalogWrapperForREST.class, wrapper);
+  }
+
+  @Test
+  public void testDefaultBackendModeStaysFederated() {
+    IcebergConfig icebergConfig =
+        new IcebergConfig(
+            ImmutableMap.of(
+                IcebergConstants.CATALOG_BACKEND,
+                "jdbc",
+                IcebergConstants.URI,
+                "jdbc:mysql://localhost:3306/metastore",
+                IcebergConstants.WAREHOUSE,
+                "/tmp/federated-wrapper-manager-test"));
+
+    CatalogWrapperForREST wrapper = newManager().createCatalogWrapper("test", icebergConfig);
+
+    Assertions.assertFalse(wrapper instanceof ManagedCatalogWrapperForREST);
+  }
+
   private static IcebergCatalogWrapperManager newManager() {
     Map<String, String> config = Maps.newHashMap();
     IcebergConfigProvider configProvider = IcebergConfigProviderFactory.create(config);

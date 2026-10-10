@@ -136,6 +136,11 @@ public class IcebergCatalogWrapperManager implements AutoCloseable {
     IcebergCatalogBackend backend =
         IcebergCatalogBackend.valueOf(
             icebergConfig.get(IcebergConfig.CATALOG_BACKEND).toUpperCase(Locale.ROOT));
+    if (isManagedBackendMode(icebergConfig)) {
+      // Gravitino owns the metadata: the wrapper delegates to the managed implementation layer and
+      // never initializes an Iceberg SDK catalog (design doc sections 5.3 and 5.9.1).
+      return new ManagedCatalogWrapperForREST(catalogName, icebergConfig);
+    }
     CatalogWrapperForREST rest =
         backend == IcebergCatalogBackend.REST
             ? new FederatedCatalogWrapper(catalogName, icebergConfig)
@@ -148,6 +153,14 @@ public class IcebergCatalogWrapperManager implements AutoCloseable {
     }
 
     return rest;
+  }
+
+  /**
+   * @param icebergConfig the catalog configuration
+   * @return whether the catalog is in managed backend mode
+   */
+  private static boolean isManagedBackendMode(IcebergConfig icebergConfig) {
+    return "managed".equalsIgnoreCase(icebergConfig.get(IcebergConfig.CATALOG_BACKEND_MODE));
   }
 
   private void closeIcebergCatalogWrapper(IcebergCatalogWrapper catalogWrapper) {
