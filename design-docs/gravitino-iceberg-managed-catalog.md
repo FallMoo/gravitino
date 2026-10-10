@@ -409,10 +409,13 @@ IcebergCatalog.newCapability()
 | `IcebergManagedCatalogOperations` | 实现层：§5.8 的五个写路径原语 + 读路径；事务、SDK 调用、SQL、entity 写入 |
 | `ManagedIcebergMetadataStore` | 所有针对 `iceberg_tables` / `iceberg_namespace_properties` 的 SQL；元数据文件辅助方法；版本号解析 |
 | `ManagedIcebergCommitHandler` | Iceberg REST 入口的 commit 适配器：校验 requirement、应用 update、写文件、更新行、失败重试、按 §5.9.3 决定是否同步 `table_meta` |
-| `IcebergTableOperationExecutor`（改造） | Iceberg REST 入口适配器：把 REST 请求翻译成 §5.8 原语 |
+| `ManagedIcebergCatalogOps`（`iceberg-common`） | REST 入口契约：用 Iceberg 类型表达的 create/load/update/register/list/exists/drop/rename/metadataLocation；由 `IcebergManagedCatalogOperations` 实现 |
+| `IcebergTableOperationExecutor`（改造） | Iceberg REST 入口适配器：把 REST 请求翻译成 §5.8 原语（经 `ManagedIcebergCatalogOps`） |
 | `TableOperationDispatcher`（改造） | Gravitino native 入口适配器（第五阶段） |
 | `IcebergTableHookDispatcher` 等 Hook 层 | managed 模式下不再承担实体写入（写入移入实现层）；保留授权相关职责 |
 | `IcebergCatalogWrapper` | 契约不变；managed 模式下读写都不再走 Iceberg 的 `JdbcCatalog` 与 `CatalogHandlers` |
+
+**为什么契约放在 `iceberg-common`。** 实现层在 `catalog-lakehouse-iceberg`，REST 入口在 `iceberg-rest-server`，后者**不依赖**前者（catalogs 是插件，反向依赖会破坏分发层布局）。契约因此放在两者共同依赖的 `iceberg-common`。这里有一个必须留意的细节：`IsolatedClassLoader.isSharedClass` 把 `org.apache.gravitino.catalog.*` 之外的一切都当作 **shared**，委派给 server 的 `baseClassLoader`，所以 `org.apache.gravitino.iceberg.common.ops.ManagedIcebergCatalogOps` 由 server 加载；而实现类落在 `org.apache.gravitino.catalog.lakehouse.iceberg.managed`（隔离加载）。因此跨隔离边界对 `catalog.ops()` 做 `instanceof ManagedIcebergCatalogOps` 是安全的，**但绝不能把契约放在 `org.apache.gravitino.catalog.*` 下**——那会被隔离加载，`instanceof` 永远为 false。
 
 `IcebergManagedCatalogOperations` 继承 `ManagedTableOperations`（与 `DeltaTableOperations`、`LanceTableOperations` 的做法一致），从而复用 `TableEntity` 构建、column entity 和 audit info 的既有代码。它通过 `GravitinoEnv` 提供 `store()`、`schemas()` 和 `idGenerator()`。
 
@@ -881,7 +884,7 @@ managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamesp
 
 **第三阶段 —— Iceberg REST 入口（主要交付目标）**
 
-* `IcebergTableOperationExecutor` / `IcebergTableOperations` 接入实现层：create / register / drop / rename 走 §5.8 原语；`stageCreate` 保持「不落库、提交时登记」的语义（§5.9.1）。
+* `IcebergTableOperationExecutor` / `IcebergTableOperations` 接入实现层：create / register / drop / rename 走 §5.8 原语；`stageCreate` 保持「不落库、提交时登记」的语义（§5.9.1）。接入方式：`IcebergCatalogWrapperManager` 在 `catalog-backend-mode=managed` 时返回 managed wrapper，wrapper 通过 `CatalogManager.loadCatalogAndWrap(...).catalog().ops()` 取得 `ManagedIcebergCatalogOps` 并转换 `LoadTableResponse`；`CatalogInfo.namespace().level(0)` 提供 metalake，用于把 Iceberg 标识符解析成 Gravitino `NameIdentifier`。
 * **去掉 Hook 层的授权 gate**：实体写入移入实现层，`IcebergTableHookDispatcher` / `IcebergNamespaceHookDispatcher` / `IcebergViewHookDispatcher` 中重复的 import 逻辑随之收敛（§5.1.1）。owner 设置、list 可见性过滤、`IcebergOrphanSchemaCleanup` 的调用时机需要回归（R12）。
 * 读取路径：`loadTable` / `listTables` / `tableExists` 走 §5.6 的 SQL + `TableMetadataParser.read`，直接构造 `LoadTableResponse`；接入 `IcebergCatalogWrapper` 与 `IcebergCatalogWrapperManager` 的 managed 分支。
 * `ManagedIcebergCommitHandler`：复刻 `CatalogHandlers.commit` 的纯逻辑 + 重试 + `isCreate` 分支，并实现 §5.9.3 的 `table_meta` 同步规则。

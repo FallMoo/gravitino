@@ -30,6 +30,7 @@ import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -57,6 +58,7 @@ import org.apache.gravitino.cache.NoOpsCache;
 import org.apache.gravitino.catalog.CatalogManager;
 import org.apache.gravitino.catalog.SchemaDispatcher;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergConstants;
+import org.apache.gravitino.connector.CatalogInfo;
 import org.apache.gravitino.exceptions.NoSuchTableException;
 import org.apache.gravitino.meta.AuditInfo;
 import org.apache.gravitino.meta.BaseMetalake;
@@ -101,7 +103,6 @@ public class TestIcebergManagedCatalogOperations {
   private static final String METALAKE = "managed_metalake";
   private static final String CATALOG = "managed_catalog";
   private static final String SCHEMA = "db";
-  private static final String ICEBERG_CATALOG_NAME = "managed-iceberg-catalog";
 
   private static Path entityDbDir;
   private static Path warehouseDir;
@@ -184,16 +185,31 @@ public class TestIcebergManagedCatalogOperations {
   }
 
   private static IcebergManagedCatalogOperations newOps() {
-    Map<String, String> conf =
-        ImmutableMap.<String, String>builder()
-            .put(IcebergConstants.CATALOG_BACKEND_MODE, "managed")
-            .put(IcebergConstants.CATALOG_BACKEND, "jdbc")
-            .put(IcebergConstants.WAREHOUSE, warehouseDir.toUri().toString())
-            .put(IcebergConstants.CATALOG_BACKEND_NAME, ICEBERG_CATALOG_NAME)
-            .build();
     IcebergManagedCatalogOperations ops = new IcebergManagedCatalogOperations();
-    ops.initialize(conf, null, null);
+    ops.initialize(conf(), null, null);
     return ops;
+  }
+
+  /**
+   * The managed operations as the Iceberg REST entry initializes them: with the catalog info, which
+   * carries the metalake the REST identifiers are resolved against.
+   */
+  private static IcebergManagedCatalogOperations newOpsForRest() {
+    IcebergManagedCatalogOperations ops = new IcebergManagedCatalogOperations();
+    ops.initialize(conf(), catalogInfo(), null);
+    return ops;
+  }
+
+  private static CatalogInfo catalogInfo() {
+    return new CatalogInfo(
+        1L,
+        CATALOG,
+        Catalog.Type.RELATIONAL,
+        "lakehouse-iceberg",
+        "managed test catalog",
+        Collections.emptyMap(),
+        null,
+        Namespace.of(METALAKE));
   }
 
   /** A schema dispatcher that reports every schema as existing, so the entity-store focus holds. */
@@ -377,7 +393,7 @@ public class TestIcebergManagedCatalogOperations {
             "INSERT INTO iceberg_tables (catalog_name, table_namespace, table_name,"
                 + " metadata_location, previous_metadata_location, iceberg_type)"
                 + " VALUES (?, 'db', ?, 'loc1', NULL, 'TABLE')")) {
-      ps.setString(1, ICEBERG_CATALOG_NAME);
+      ps.setString(1, CATALOG);
       ps.setString(2, tableName);
       ps.executeUpdate();
     }
@@ -554,7 +570,7 @@ public class TestIcebergManagedCatalogOperations {
         .put(IcebergConstants.CATALOG_BACKEND_MODE, "managed")
         .put(IcebergConstants.CATALOG_BACKEND, "jdbc")
         .put(IcebergConstants.WAREHOUSE, warehouseDir.toUri().toString())
-        .put(IcebergConstants.CATALOG_BACKEND_NAME, ICEBERG_CATALOG_NAME)
+        .put(IcebergConstants.CATALOG_BACKEND_NAME, CATALOG)
         .build();
   }
 
@@ -661,5 +677,159 @@ public class TestIcebergManagedCatalogOperations {
             .properties()
             .containsKey("structure.change"),
         "a structure/property commit must synchronize table_meta");
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Iceberg REST entry surface (design doc sections 5.9.1 and 5.10, tests 7 / 9 / 13)
+  // ---------------------------------------------------------------------------------------------
+
+  private static org.apache.iceberg.rest.requests.CreateTableRequest restCreateRequest(
+      String name, boolean stageCreate) {
+    org.apache.iceberg.rest.requests.CreateTableRequest.Builder builder =
+        org.apache.iceberg.rest.requests.CreateTableRequest.builder()
+            .withName(name)
+            .withSchema(
+                new org.apache.iceberg.Schema(
+                    org.apache.iceberg.types.Types.NestedField.required(
+                        1, "id", org.apache.iceberg.types.Types.IntegerType.get()),
+                    org.apache.iceberg.types.Types.NestedField.optional(
+                        2, "name", org.apache.iceberg.types.Types.StringType.get())))
+            .withPartitionSpec(org.apache.iceberg.PartitionSpec.unpartitioned())
+            .withWriteOrder(org.apache.iceberg.SortOrder.unsorted())
+            // A mutable map: Iceberg's builder probes it with a null key, which Map.of rejects.
+            .setProperties(new java.util.HashMap<>(Map.of("owner", "spike")));
+    if (stageCreate) {
+      builder.stageCreate();
+    }
+    return builder.build();
+  }
+
+  @Test
+  public void testRestCreateLoadListAndMetadataLocation() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    org.apache.iceberg.catalog.TableIdentifier identifier =
+        org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_rest");
+
+    org.apache.iceberg.rest.responses.LoadTableResponse created =
+        ops.createTable(namespace, restCreateRequest("t_rest", false));
+    assertEquals(2, created.tableMetadata().schema().columns().size());
+    assertTrue(ops.tableExists(identifier));
+    assertEquals(1L, countIcebergRows("t_rest"));
+    assertEquals(1L, countTableMetaRows("t_rest"));
+    assertTrue(
+        Files.exists(
+            Paths.get(java.net.URI.create(created.tableMetadata().metadataFileLocation()))),
+        "the metadata file is missing");
+
+    org.apache.iceberg.rest.responses.LoadTableResponse loaded = ops.loadTable(identifier);
+    assertEquals(
+        created.tableMetadata().metadataFileLocation(),
+        loaded.tableMetadata().metadataFileLocation());
+
+    org.apache.iceberg.rest.responses.ListTablesResponse listed = ops.listTables(namespace);
+    assertEquals(
+        java.util.List.of(identifier),
+        listed.identifiers().stream()
+            .filter(t -> t.name().equals("t_rest"))
+            .collect(java.util.stream.Collectors.toList()));
+    assertEquals(
+        Optional.of(created.tableMetadata().metadataFileLocation()),
+        ops.metadataLocation(identifier));
+    assertEquals(
+        Optional.empty(),
+        ops.metadataLocation(
+            org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_missing")));
+  }
+
+  @Test
+  public void testRestStageCreateWritesNeitherRowNorEntity() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+
+    org.apache.iceberg.rest.responses.LoadTableResponse staged =
+        ops.createTable(namespace, restCreateRequest("t_staged", true));
+
+    assertNotNull(staged.tableMetadata(), "a staged create still returns metadata");
+    assertFalse(
+        ops.tableExists(org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_staged")));
+    assertEquals(0L, countIcebergRows("t_staged"), "a staged create must not write a row");
+    assertEquals(0L, countTableMetaRows("t_staged"), "a staged create must not write an entity");
+    assertNull(
+        staged.tableMetadata().metadataFileLocation(),
+        "a staged create must not write a metadata file");
+    assertFalse(
+        Files.exists(Paths.get(java.net.URI.create(staged.tableMetadata().location()))),
+        "a staged create must not create the table directory");
+  }
+
+  @Test
+  public void testRestUpdateTableCommitsThroughTheHandler() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    org.apache.iceberg.catalog.TableIdentifier identifier =
+        org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_rest_update");
+    ops.createTable(namespace, restCreateRequest("t_rest_update", false));
+
+    org.apache.iceberg.TableMetadata base = ops.loadTable(identifier).tableMetadata();
+    org.apache.iceberg.rest.requests.UpdateTableRequest request =
+        org.apache.iceberg.rest.requests.UpdateTableRequest.create(
+            identifier,
+            java.util.List.of(
+                new org.apache.iceberg.UpdateRequirement.AssertTableUUID(base.uuid())),
+            java.util.List.of(
+                new org.apache.iceberg.MetadataUpdate.SetProperties(Map.of("rest", "true"))));
+
+    org.apache.iceberg.rest.responses.LoadTableResponse updated =
+        ops.updateTable(identifier, request);
+    assertEquals("true", updated.tableMetadata().properties().get("rest"));
+    assertTrue(
+        store
+            .get(tableIdent("t_rest_update"), Entity.EntityType.TABLE, TableEntity.class)
+            .properties()
+            .containsKey("rest"),
+        "the REST commit did not synchronize table_meta");
+    assertEquals(
+        updated.tableMetadata().metadataFileLocation(),
+        ops.metadataLocation(identifier).orElseThrow());
+  }
+
+  @Test
+  public void testRestRegisterRenameAndDrop() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    org.apache.iceberg.catalog.TableIdentifier identifier =
+        org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_rest_reg");
+
+    // Create a table to obtain a real metadata file, then register that file under a new name.
+    ops.createTable(namespace, restCreateRequest("t_rest_source", false));
+    String metadataLocation =
+        ops.metadataLocation(
+                org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_rest_source"))
+            .orElseThrow();
+
+    org.apache.iceberg.rest.responses.LoadTableResponse registered =
+        ops.registerTable(
+            namespace,
+            org.apache.iceberg.rest.requests.ImmutableRegisterTableRequest.builder()
+                .name("t_rest_reg")
+                .metadataLocation(metadataLocation)
+                .build());
+    assertEquals(2, registered.tableMetadata().schema().columns().size());
+    assertTrue(ops.tableExists(identifier));
+
+    org.apache.iceberg.catalog.TableIdentifier renamed =
+        org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_rest_renamed");
+    ops.renameTable(identifier, renamed);
+    assertFalse(ops.tableExists(identifier));
+    assertTrue(ops.tableExists(renamed));
+
+    ops.dropTable(renamed, false);
+    assertFalse(ops.tableExists(renamed));
+    assertEquals(0L, countIcebergRows("t_rest_renamed"));
   }
 }

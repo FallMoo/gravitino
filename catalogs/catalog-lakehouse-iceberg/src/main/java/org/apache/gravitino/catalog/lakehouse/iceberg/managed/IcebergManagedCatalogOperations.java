@@ -49,6 +49,8 @@ import org.apache.gravitino.exceptions.NoSuchSchemaException;
 import org.apache.gravitino.exceptions.NoSuchTableException;
 import org.apache.gravitino.exceptions.TableAlreadyExistsException;
 import org.apache.gravitino.iceberg.common.IcebergConfig;
+import org.apache.gravitino.iceberg.common.ops.ManagedIcebergCatalogOps;
+import org.apache.gravitino.iceberg.common.utils.IcebergIdentifierUtils;
 import org.apache.gravitino.meta.AuditInfo;
 import org.apache.gravitino.meta.ColumnEntity;
 import org.apache.gravitino.meta.TableEntity;
@@ -63,14 +65,20 @@ import org.apache.gravitino.rel.indexes.Index;
 import org.apache.gravitino.rel.indexes.Indexes;
 import org.apache.gravitino.storage.IdGenerator;
 import org.apache.gravitino.storage.relational.utils.SessionUtils;
+import org.apache.gravitino.utils.HierarchicalSchemaUtil;
 import org.apache.gravitino.utils.PrincipalUtils;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.ResolvingFileIO;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
+import org.apache.iceberg.rest.requests.RegisterTableRequest;
+import org.apache.iceberg.rest.requests.UpdateTableRequest;
+import org.apache.iceberg.rest.responses.ListTablesResponse;
+import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.util.LocationUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -84,17 +92,19 @@ import org.slf4j.LoggerFactory;
  * store connection inside one transaction. The Iceberg SDK never opens a database connection.
  */
 public class IcebergManagedCatalogOperations extends ManagedTableOperations
-    implements CatalogOperations {
+    implements CatalogOperations, ManagedIcebergCatalogOps {
 
   private static final Logger LOG = LoggerFactory.getLogger(IcebergManagedCatalogOperations.class);
 
   /** SQL state class for integrity constraint violations. */
   private static final String SQL_STATE_INTEGRITY_CONSTRAINT = "23";
 
+  private String metalakeName;
   private String catalogName;
   private String warehouse;
   private ManagedIcebergMetadataStore metadataStore;
   private FileIO fileIO;
+  private ManagedIcebergCommitHandler commitHandler;
 
   @Override
   public void initialize(
@@ -107,6 +117,13 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
     this.catalogName = conf.get(IcebergConstants.CATALOG_BACKEND_NAME);
     this.warehouse = conf.get(IcebergConstants.WAREHOUSE);
     this.metadataStore = new ManagedIcebergMetadataStore(catalogName);
+    // The Iceberg REST entry addresses tables through the catalog's metalake; CatalogInfo carries
+    // it as the catalog namespace.
+    this.metalakeName =
+        info == null || info.namespace() == null || info.namespace().length() == 0
+            ? null
+            : info.namespace().level(0);
+    this.commitHandler = new ManagedIcebergCommitHandler(this);
 
     Map<String, String> icebergProperties = new IcebergConfig(conf).getIcebergCatalogProperties();
     String ioImpl = conf.get(IcebergConstants.IO_IMPL);
@@ -185,6 +202,112 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
   @Override
   public Table loadTable(NameIdentifier ident) throws NoSuchTableException {
     return IcebergTable.fromIcebergTable(readMetadata(ident), ident.name());
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Iceberg REST entry surface (design doc sections 5.9.1 and 5.10)
+  // ---------------------------------------------------------------------------------------------
+
+  @Override
+  public LoadTableResponse createTable(
+      org.apache.iceberg.catalog.Namespace namespace, CreateTableRequest request) {
+    NameIdentifier ident = toNameIdentifier(TableIdentifier.of(namespace, request.name()));
+    String location =
+        StringUtils.isNotBlank(request.location())
+            ? request.location()
+            : defaultTableLocation(ident);
+    // CreateTableRequest leaves spec/writeOrder null when the client did not ask for any.
+    org.apache.iceberg.PartitionSpec spec =
+        request.spec() == null ? org.apache.iceberg.PartitionSpec.unpartitioned() : request.spec();
+    org.apache.iceberg.SortOrder writeOrder =
+        request.writeOrder() == null
+            ? org.apache.iceberg.SortOrder.unsorted()
+            : request.writeOrder();
+    TableMetadata metadata =
+        TableMetadata.newTableMetadata(
+            request.schema(), spec, writeOrder, location, request.properties());
+
+    if (request.stageCreate()) {
+      // A staged create writes neither a row nor an entity: the client is expected to follow up
+      // with an isCreate commit (design doc section 5.9.1).
+      return LoadTableResponse.builder().withTableMetadata(metadata).build();
+    }
+
+    createTableFromMetadata(ident, metadata, metadata.properties());
+    return LoadTableResponse.builder().withTableMetadata(readMetadata(ident)).build();
+  }
+
+  @Override
+  public LoadTableResponse loadTable(TableIdentifier identifier) {
+    return LoadTableResponse.builder()
+        .withTableMetadata(readMetadata(toNameIdentifier(identifier)))
+        .build();
+  }
+
+  @Override
+  public LoadTableResponse updateTable(TableIdentifier identifier, UpdateTableRequest request) {
+    return LoadTableResponse.builder()
+        .withTableMetadata(commitHandler.commit(toNameIdentifier(identifier), request))
+        .build();
+  }
+
+  @Override
+  public LoadTableResponse registerTable(
+      org.apache.iceberg.catalog.Namespace namespace, RegisterTableRequest request) {
+    NameIdentifier ident = toNameIdentifier(TableIdentifier.of(namespace, request.name()));
+    registerTable(ident, request.metadataLocation());
+    return LoadTableResponse.builder().withTableMetadata(readMetadata(ident)).build();
+  }
+
+  @Override
+  public ListTablesResponse listTables(org.apache.iceberg.catalog.Namespace namespace) {
+    String schemaName =
+        IcebergIdentifierUtils.icebergNamespaceToSchemaName(
+            namespace, HierarchicalSchemaUtil.schemaSeparator());
+    NameIdentifier[] identifiers = listTables(Namespace.of(metalakeName, catalogName, schemaName));
+    ListTablesResponse.Builder builder = ListTablesResponse.builder();
+    for (NameIdentifier identifier : identifiers) {
+      builder.add(IcebergCatalogWrapperHelper.buildIcebergTableIdentifier(identifier));
+    }
+    return builder.build();
+  }
+
+  @Override
+  public boolean tableExists(TableIdentifier identifier) {
+    return tableExists(toNameIdentifier(identifier));
+  }
+
+  @Override
+  public void dropTable(TableIdentifier identifier, boolean purge) {
+    NameIdentifier ident = toNameIdentifier(identifier);
+    if (purge) {
+      purgeTable(ident);
+    } else {
+      dropTable(ident);
+    }
+  }
+
+  @Override
+  public void renameTable(TableIdentifier from, TableIdentifier to) {
+    renameTable(toNameIdentifier(from), toNameIdentifier(to));
+  }
+
+  @Override
+  public Optional<String> metadataLocation(TableIdentifier identifier) {
+    NameIdentifier ident = toNameIdentifier(identifier);
+    if (!tableExists(ident)) {
+      return Optional.empty();
+    }
+    return Optional.of(selectTableRowOrThrow(ident).metadataLocation());
+  }
+
+  private NameIdentifier toNameIdentifier(TableIdentifier identifier) {
+    Preconditions.checkArgument(
+        metalakeName != null,
+        "The managed Iceberg catalog operations were not initialized with a catalog info carrying"
+            + " the metalake name.");
+    return IcebergIdentifierUtils.toGravitinoTableIdentifier(
+        metalakeName, catalogName, identifier, HierarchicalSchemaUtil.schemaSeparator());
   }
 
   // ---------------------------------------------------------------------------------------------
