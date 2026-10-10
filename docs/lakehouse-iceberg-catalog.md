@@ -49,6 +49,7 @@ Mixing Iceberg JARs from different versions on the client classpath is not compa
 | `uri`                  | The URI configuration of the Iceberg catalog. `thrift://127.0.0.1:9083` or `jdbc:postgresql://127.0.0.1:5432/db_name` or `jdbc:mysql://127.0.0.1:3306/metastore_db` or `http://127.0.0.1:9001/iceberg`. | (none)                                                                         | Yes                                       | 0.2.0         |
 | `warehouse`            | Warehouse location of catalog. Use a physical S3 or HDFS location for `hive` or `jdbc` catalog backend, use catalog name for REST catalog backend.                                                      | (none)                                                                         | Yes for `hive` and `jdbc` catalog backend | 0.2.0         |
 | `catalog-backend-name` | The catalog name passed to underlying Iceberg catalog backend. Catalog name in JDBC backend is used to isolate namespace and tables.                                                                    | The property value of `catalog-backend`, like `jdbc` for JDBC catalog backend. | No                                        | 0.5.2         |
+| `catalog-backend-mode` | Who owns the Iceberg metadata. `federated` (default) delegates to the Iceberg catalog backend; `managed` makes Gravitino own it and requires `catalog-backend` to be `jdbc`.                                | `federated`                                                                    | No                                        | 1.3.0         |
 
 
 Any property not defined by Gravitino with `gravitino.bypass.` prefix will pass to Iceberg catalog properties and HDFS configuration. For example, if specify `gravitino.bypass.list-all-tables`, `list-all-tables` will pass to Iceberg catalog properties.
@@ -75,6 +76,54 @@ If you have a JDBC Iceberg catalog prior, you must set `catalog-backend-name` to
 Download the corresponding JDBC driver and place it to the `catalogs/lakehouse-iceberg/libs` directory If you are using JDBC backend.
 If you are using multiple JDBC catalog backends, setting `jdbc-initialize` to true may not take effect for RDMS like `Mysql`, you should create Iceberg meta tables explicitly.
 :::
+
+#### Managed Backend Mode
+
+By default Gravitino acts as a proxy: the Iceberg catalog backend owns the metadata, and Gravitino
+keeps a copy of the table metadata for its own APIs. Setting `catalog-backend-mode` to `managed`
+inverts that relationship - Gravitino writes the Iceberg metadata files and the Iceberg pointer
+tables itself, and the Iceberg catalog backend is not used at all.
+
+```properties
+catalog-backend = jdbc
+catalog-backend-mode = managed
+warehouse = hdfs://127.0.0.1:9000/warehouse
+catalog-backend-name = my_catalog
+```
+
+Requirements:
+
+- `catalog-backend` must be `jdbc`. Managed mode reuses the Iceberg JDBC pointer tables
+  (`iceberg_tables`, `iceberg_namespace_properties`) but not the Iceberg JDBC catalog.
+- Gravitino must run with the auxiliary Iceberg REST service enabled, because the Iceberg REST
+  endpoint is the entry point for managed catalogs.
+- The Iceberg pointer tables must live in the same database as the Gravitino entity store: managed
+  mode writes the pointer row and the Gravitino table metadata in a single transaction.
+- `catalog-backend-name` should be the Gravitino catalog name, so that the Iceberg REST prefix
+  resolves to the same catalog.
+- `uri` is not required in managed mode.
+
+Differences from `federated` mode:
+
+- `create`/`drop`/`rename`/`register` and Iceberg REST commits update both the Iceberg pointer row
+  and the Gravitino table metadata, so a table is never visible in one store only.
+- Gravitino writes the metadata even when authorization is disabled; the authorization switch only
+  controls permissions, not whether the metadata is recorded.
+- Namespace operations are stored in `iceberg_namespace_properties` and create the Gravitino schema
+  in the same transaction.
+
+The Iceberg tables are created at catalog initialization. If the Gravitino database user is not
+allowed to run DDL, create them beforehand with
+`scripts/<database>/iceberg-managed-catalog-1.3.0-<database>.sql`.
+
+Limitations:
+
+- Iceberg views are not supported.
+- The Gravitino native Iceberg catalog API only supports read, create, drop, register, rename and
+  purge; altering a table through the Gravitino API (rather than the Iceberg REST API) is not
+  supported yet.
+- Credential vending and scan planning are not available, because no Iceberg catalog instance is
+  created.
 
 #### REST Catalog Backend
 

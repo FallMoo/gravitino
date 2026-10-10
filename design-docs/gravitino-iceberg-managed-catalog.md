@@ -801,6 +801,14 @@ Gravitino 的内存 `LocalTableMetadataCache` 必须在每次写入后失效、�
 
 managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamespaces`（外加命名空间存在性检查 —— Iceberg 的 JDBC 后端是从 `iceberg_tables` 与 `iceberg_namespace_properties` 共同推导命名空间存在性的）。对应的 `SchemaEntity` 由 Gravitino 在同一事务内写入，因为 `managedStorage(SCHEMA)` 同样被声明为 `SUPPORTED`。
 
+实施细节（按 Iceberg JDBC 后端的语义对齐）：
+
+* **创建时必须落至少一行属性**：命名空间存在性是从属性行 / 表 / 子命名空间推导的，因此请求未带属性时注入 `location`（`warehouse/<namespace>`）。这与 Iceberg 的 `JdbcUtil.namespaceProperties` 一致。
+* **列表要 union 两张表**：只看 `iceberg_namespace_properties` 会漏掉"由表隐式创建"的命名空间，因此 `listAllNamespaces` 是两表的 `UNION`；`listNamespaces(parent)` 再按 `parent + "."` 前缀取**直接子级**。
+* **删除前判空**：既有表又有子命名空间时抛 `NamespaceNotEmptyException`，且失败不得删除任何行（判空在事务内、删除之前）。
+* **属性更新是可移植的 upsert**：先 `UPDATE`，影响 0 行再 `INSERT`（避免依赖方言的 `ON CONFLICT`/`REPLACE`）；同时把最终的属性集回写到 `SchemaEntity`，保持两个 store 的视图一致（实体不存在时补建）。
+* 契约同样挂在 `ManagedIcebergCatalogOps` 上（`iceberg-common`），由 `ManagedCatalogWrapperForREST` 委托。
+
 ### 5.12 实施前置验证结论
 
 本设计的三块地基在**写实现之前**用一次性证伪测试（falsification spike）实测过，结论如下（证据为本地记录，未进入仓库）：

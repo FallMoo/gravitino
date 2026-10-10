@@ -59,6 +59,7 @@ import org.apache.gravitino.catalog.CatalogManager;
 import org.apache.gravitino.catalog.SchemaDispatcher;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergConstants;
 import org.apache.gravitino.connector.CatalogInfo;
+import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.exceptions.NoSuchTableException;
 import org.apache.gravitino.meta.AuditInfo;
 import org.apache.gravitino.meta.BaseMetalake;
@@ -247,6 +248,7 @@ public class TestIcebergManagedCatalogOperations {
     try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
         Statement statement = connection.createStatement()) {
       statement.execute("DELETE FROM iceberg_tables");
+      statement.execute("DELETE FROM iceberg_namespace_properties");
       statement.execute("DELETE FROM table_meta");
       statement.execute("DELETE FROM schema_meta");
       statement.execute("DELETE FROM catalog_meta");
@@ -831,5 +833,129 @@ public class TestIcebergManagedCatalogOperations {
     ops.dropTable(renamed, false);
     assertFalse(ops.tableExists(renamed));
     assertEquals(0L, countIcebergRows("t_rest_renamed"));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Namespace operations (design doc section 5.11)
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testCreateLoadListAndDropNamespace() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of("ns_a");
+
+    org.apache.iceberg.rest.responses.CreateNamespaceResponse created =
+        ops.createNamespace(
+            org.apache.iceberg.rest.requests.CreateNamespaceRequest.builder()
+                .withNamespace(namespace)
+                .setProperties(new java.util.HashMap<>(Map.of("owner", "spike")))
+                .build());
+    assertEquals(namespace, created.namespace());
+    assertEquals("spike", created.properties().get("owner"));
+    assertTrue(created.properties().containsKey("location"), "a location must always be stored");
+
+    assertTrue(ops.namespaceExists(namespace));
+    assertEquals(
+        created.properties(),
+        ops.loadNamespace(namespace).properties(),
+        "loadNamespace must return the stored properties");
+
+    // The Gravitino schema entity is written in the same transaction.
+    NameIdentifier schemaIdent = NameIdentifier.of(Namespace.of(METALAKE, CATALOG), "ns_a");
+    assertNotNull(store.get(schemaIdent, Entity.EntityType.SCHEMA, SchemaEntity.class));
+    assertEquals(2L, countNamespacePropertyRows("ns_a"), "two properties must be stored");
+
+    // A namespace created with no properties still exists, because a location is injected.
+    org.apache.iceberg.catalog.Namespace empty =
+        org.apache.iceberg.catalog.Namespace.of("ns_empty");
+    ops.createNamespace(
+        org.apache.iceberg.rest.requests.CreateNamespaceRequest.builder()
+            .withNamespace(empty)
+            .build());
+    assertTrue(ops.namespaceExists(empty));
+
+    assertEquals(
+        java.util.List.of(namespace, empty),
+        ops.listNamespaces(org.apache.iceberg.catalog.Namespace.empty()).namespaces());
+
+    ops.dropNamespace(namespace);
+    assertFalse(ops.namespaceExists(namespace));
+    assertEquals(0L, countNamespacePropertyRows("ns_a"));
+    assertThrows(
+        NoSuchEntityException.class,
+        () -> store.get(schemaIdent, Entity.EntityType.SCHEMA, SchemaEntity.class));
+  }
+
+  @Test
+  public void testDropNamespaceRejectsANonEmptyNamespace() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of("ns_full");
+    ops.createNamespace(
+        org.apache.iceberg.rest.requests.CreateNamespaceRequest.builder()
+            .withNamespace(namespace)
+            .build());
+    ops.createTable(namespace, restCreateRequest("t_in_ns", false));
+
+    assertThrows(
+        org.apache.iceberg.exceptions.NamespaceNotEmptyException.class,
+        () -> ops.dropNamespace(namespace));
+    assertTrue(ops.namespaceExists(namespace), "a failed drop must not delete the namespace");
+  }
+
+  @Test
+  public void testUpdateNamespaceProperties() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of("ns_props");
+    ops.createNamespace(
+        org.apache.iceberg.rest.requests.CreateNamespaceRequest.builder()
+            .withNamespace(namespace)
+            .setProperties(new java.util.HashMap<>(Map.of("owner", "spike")))
+            .build());
+
+    org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest request =
+        updateNamespaceRequest(java.util.List.of("owner"), Map.of("team", "lakehouse"));
+
+    org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse response =
+        ops.updateNamespaceProperties(namespace, request);
+    assertEquals(java.util.List.of("owner"), response.removed());
+    assertTrue(response.updated().contains("team"));
+
+    Map<String, String> stored = ops.loadNamespace(namespace).properties();
+    assertFalse(stored.containsKey("owner"));
+    assertEquals("lakehouse", stored.get("team"));
+    // The Gravitino schema entity keeps the same property view.
+    assertEquals(
+        stored,
+        store
+            .get(
+                NameIdentifier.of(Namespace.of(METALAKE, CATALOG), "ns_props"),
+                Entity.EntityType.SCHEMA,
+                SchemaEntity.class)
+            .properties());
+  }
+
+  private static org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest
+      updateNamespaceRequest(java.util.List<String> removals, Map<String, String> updates) {
+    return org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest.builder()
+        // Mutable collections: Iceberg's builder probes them with a null key, which immutable
+        // collections reject.
+        .removeAll(new java.util.ArrayList<>(removals))
+        .updateAll(new java.util.HashMap<>(updates))
+        .build();
+  }
+
+  private static long countNamespacePropertyRows(String namespace) throws SQLException {
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
+        Statement statement = connection.createStatement();
+        ResultSet rs =
+            statement.executeQuery(
+                String.format(
+                    "SELECT COUNT(*) FROM iceberg_namespace_properties WHERE namespace = '%s'",
+                    namespace))) {
+      return rs.next() ? rs.getLong(1) : -1L;
+    }
   }
 }

@@ -25,9 +25,12 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.gravitino.Entity;
 import org.apache.gravitino.EntityStore;
@@ -53,6 +56,7 @@ import org.apache.gravitino.iceberg.common.ops.ManagedIcebergCatalogOps;
 import org.apache.gravitino.iceberg.common.utils.IcebergIdentifierUtils;
 import org.apache.gravitino.meta.AuditInfo;
 import org.apache.gravitino.meta.ColumnEntity;
+import org.apache.gravitino.meta.SchemaEntity;
 import org.apache.gravitino.meta.TableEntity;
 import org.apache.gravitino.rel.Column;
 import org.apache.gravitino.rel.Table;
@@ -71,14 +75,23 @@ import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
+import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.ResolvingFileIO;
+import org.apache.iceberg.rest.requests.CreateNamespaceRequest;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
 import org.apache.iceberg.rest.requests.RegisterTableRequest;
+import org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest;
 import org.apache.iceberg.rest.requests.UpdateTableRequest;
+import org.apache.iceberg.rest.responses.CreateNamespaceResponse;
+import org.apache.iceberg.rest.responses.GetNamespaceResponse;
+import org.apache.iceberg.rest.responses.ListNamespacesResponse;
 import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
+import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
 import org.apache.iceberg.util.LocationUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -308,6 +321,240 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
             + " the metalake name.");
     return IcebergIdentifierUtils.toGravitinoTableIdentifier(
         metalakeName, catalogName, identifier, HierarchicalSchemaUtil.schemaSeparator());
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Namespace operations (design doc section 5.11)
+  // ---------------------------------------------------------------------------------------------
+
+  /** The Iceberg namespace property that carries the namespace location. */
+  private static final String NAMESPACE_LOCATION_PROPERTY = "location";
+
+  @Override
+  public CreateNamespaceResponse createNamespace(CreateNamespaceRequest request) {
+    org.apache.iceberg.catalog.Namespace namespace = request.namespace();
+    String tableNamespace = namespaceToTableNamespace(namespace);
+    NameIdentifier schemaIdent = toSchemaIdentifier(namespace);
+
+    if (namespaceExists(namespace)) {
+      throw new AlreadyExistsException("Namespace %s already exists", tableNamespace);
+    }
+
+    Map<String, String> properties = new LinkedHashMap<>(request.properties());
+    // Iceberg's JDBC backend always stores a location, and namespace existence is derived from the
+    // property rows, so a request without properties still needs one row.
+    properties.putIfAbsent(NAMESPACE_LOCATION_PROPERTY, defaultNamespaceLocation(namespace));
+
+    runWriteOrFail(
+        connection -> {
+          for (Map.Entry<String, String> entry : properties.entrySet()) {
+            metadataStore.insertNamespaceProperty(
+                connection, tableNamespace, entry.getKey(), entry.getValue());
+          }
+          // The Gravitino schema entity is written in the same transaction, because
+          // managedStorage(SCHEMA) is declared SUPPORTED.
+          putSchemaEntity(schemaIdent, properties);
+          return null;
+        });
+
+    return CreateNamespaceResponse.builder()
+        .withNamespace(namespace)
+        .setProperties(properties)
+        .build();
+  }
+
+  @Override
+  public void dropNamespace(org.apache.iceberg.catalog.Namespace namespace) {
+    String tableNamespace = namespaceToTableNamespace(namespace);
+    if (!namespaceExists(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", tableNamespace);
+    }
+
+    runWriteOrFail(
+        connection -> {
+          if (metadataStore.countTables(connection, tableNamespace) > 0) {
+            throw new NamespaceNotEmptyException("Namespace %s is not empty", tableNamespace);
+          }
+          if (!listChildNamespaces(tableNamespace).isEmpty()) {
+            throw new NamespaceNotEmptyException("Namespace %s is not empty", tableNamespace);
+          }
+          metadataStore.deleteNamespaceProperties(connection, tableNamespace);
+          deleteSchemaEntity(toSchemaIdentifier(namespace));
+          return null;
+        });
+  }
+
+  @Override
+  public GetNamespaceResponse loadNamespace(org.apache.iceberg.catalog.Namespace namespace) {
+    String tableNamespace = namespaceToTableNamespace(namespace);
+    if (!namespaceExists(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", tableNamespace);
+    }
+    Map<String, String> properties =
+        runInTransaction(
+            connection -> metadataStore.loadNamespaceProperties(connection, tableNamespace));
+    return GetNamespaceResponse.builder()
+        .withNamespace(namespace)
+        .setProperties(properties)
+        .build();
+  }
+
+  @Override
+  public boolean namespaceExists(org.apache.iceberg.catalog.Namespace namespace) {
+    String tableNamespace = namespaceToTableNamespace(namespace);
+    return runInTransaction(
+        connection -> metadataStore.namespaceExists(connection, tableNamespace));
+  }
+
+  @Override
+  public ListNamespacesResponse listNamespaces(org.apache.iceberg.catalog.Namespace parent) {
+    String parentName = namespaceToTableNamespace(parent);
+    List<org.apache.iceberg.catalog.Namespace> children = new ArrayList<>();
+    for (String child : listChildNamespaces(parentName)) {
+      children.add(org.apache.iceberg.catalog.Namespace.of(child.split("\\.")));
+    }
+    return ListNamespacesResponse.builder().addAll(children).build();
+  }
+
+  @Override
+  public UpdateNamespacePropertiesResponse updateNamespaceProperties(
+      org.apache.iceberg.catalog.Namespace namespace, UpdateNamespacePropertiesRequest request) {
+    String tableNamespace = namespaceToTableNamespace(namespace);
+    if (!namespaceExists(namespace)) {
+      throw new NoSuchNamespaceException("Namespace does not exist: %s", tableNamespace);
+    }
+
+    Set<String> removals = new LinkedHashSet<>(request.removals());
+    Map<String, String> updates = new LinkedHashMap<>(request.updates());
+    Set<String> both = new LinkedHashSet<>(removals);
+    both.retainAll(updates.keySet());
+    if (!both.isEmpty()) {
+      throw new IllegalArgumentException(
+          "Cannot remove and update the same namespace properties: " + both);
+    }
+
+    List<String> missing = new ArrayList<>();
+    runWriteOrFail(
+        connection -> {
+          for (String key : removals) {
+            if (metadataStore.deleteNamespaceProperty(connection, tableNamespace, key) == 0) {
+              missing.add(key);
+            }
+          }
+          for (Map.Entry<String, String> entry : updates.entrySet()) {
+            // Portable upsert: UPDATE first, INSERT when the key is new.
+            if (metadataStore.updateNamespaceProperty(
+                    connection, tableNamespace, entry.getKey(), entry.getValue())
+                == 0) {
+              metadataStore.insertNamespaceProperty(
+                  connection, tableNamespace, entry.getKey(), entry.getValue());
+            }
+          }
+          putOrUpdateSchemaEntity(
+              toSchemaIdentifier(namespace),
+              metadataStore.loadNamespaceProperties(connection, tableNamespace));
+          return null;
+        });
+
+    return UpdateNamespacePropertiesResponse.builder()
+        .addRemoved(removals)
+        .addUpdated(updates.keySet())
+        .addMissing(missing)
+        .build();
+  }
+
+  /** The immediate children of a dotted namespace, or the top level for the empty namespace. */
+  private List<String> listChildNamespaces(String parentName) {
+    List<String> all = runInTransaction(connection -> metadataStore.listAllNamespaces(connection));
+    Set<String> children = new LinkedHashSet<>();
+    for (String candidate : all) {
+      if (!parentName.isEmpty()) {
+        if (!candidate.startsWith(parentName + ".")) {
+          continue;
+        }
+        candidate = candidate.substring(parentName.length() + 1);
+      }
+      int separator = candidate.indexOf('.');
+      if (separator > 0) {
+        candidate = candidate.substring(0, separator);
+      }
+      if (!candidate.isEmpty()) {
+        children.add(candidate);
+      }
+    }
+    return new ArrayList<>(children);
+  }
+
+  private void putSchemaEntity(NameIdentifier schemaIdent, Map<String, String> properties) {
+    SchemaEntity entity =
+        SchemaEntity.builder()
+            .withId(idGenerator().nextId())
+            .withName(schemaIdent.name())
+            .withNamespace(schemaIdent.namespace())
+            .withComment(null)
+            .withProperties(properties)
+            .withAuditInfo(currentAuditInfo())
+            .build();
+    try {
+      store().put(entity, false /* overwrite */);
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to create the Gravitino schema entity " + schemaIdent, e);
+    }
+  }
+
+  private void putOrUpdateSchemaEntity(NameIdentifier schemaIdent, Map<String, String> properties) {
+    try {
+      store()
+          .update(
+              schemaIdent,
+              SchemaEntity.class,
+              Entity.EntityType.SCHEMA,
+              entity ->
+                  SchemaEntity.builder()
+                      .withId(entity.id())
+                      .withName(entity.name())
+                      .withNamespace(entity.namespace())
+                      .withComment(entity.comment())
+                      .withProperties(properties)
+                      .withAuditInfo(
+                          AuditInfo.builder()
+                              .withCreator(entity.auditInfo().creator())
+                              .withCreateTime(entity.auditInfo().createTime())
+                              .withLastModifier(PrincipalUtils.getCurrentPrincipal().getName())
+                              .withLastModifiedTime(Instant.now())
+                              .build())
+                      .build());
+    } catch (NoSuchEntityException e) {
+      // The namespace exists in iceberg_namespace_properties but has no Gravitino schema entity yet
+      // (for example it was created implicitly by a table): create it now.
+      putSchemaEntity(schemaIdent, properties);
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to update the Gravitino schema entity " + schemaIdent, e);
+    }
+  }
+
+  private void deleteSchemaEntity(NameIdentifier schemaIdent) {
+    try {
+      store().delete(schemaIdent, Entity.EntityType.SCHEMA, false);
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to delete the Gravitino schema entity " + schemaIdent, e);
+    }
+  }
+
+  private NameIdentifier toSchemaIdentifier(org.apache.iceberg.catalog.Namespace namespace) {
+    String schemaName =
+        IcebergIdentifierUtils.icebergNamespaceToSchemaName(
+            namespace, HierarchicalSchemaUtil.schemaSeparator());
+    return NameIdentifier.of(Namespace.of(metalakeName, catalogName), schemaName);
+  }
+
+  private static String namespaceToTableNamespace(org.apache.iceberg.catalog.Namespace namespace) {
+    return String.join(".", namespace.levels());
+  }
+
+  private String defaultNamespaceLocation(org.apache.iceberg.catalog.Namespace namespace) {
+    return String.format(
+        "%s/%s", LocationUtil.stripTrailingSlash(warehouse), namespaceToTableNamespace(namespace));
   }
 
   // ---------------------------------------------------------------------------------------------

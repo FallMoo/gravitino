@@ -21,11 +21,17 @@ package org.apache.gravitino.iceberg.common.ops;
 import java.util.Optional;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.rest.requests.CreateNamespaceRequest;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
 import org.apache.iceberg.rest.requests.RegisterTableRequest;
+import org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest;
 import org.apache.iceberg.rest.requests.UpdateTableRequest;
+import org.apache.iceberg.rest.responses.CreateNamespaceResponse;
+import org.apache.iceberg.rest.responses.GetNamespaceResponse;
+import org.apache.iceberg.rest.responses.ListNamespacesResponse;
 import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
+import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
 
 /**
  * The Iceberg REST entry's view of a Gravitino-managed Iceberg catalog (design doc section 5.3).
@@ -114,4 +120,52 @@ public interface ManagedIcebergCatalogOps {
    * @return the current metadata file location, or empty when the table does not exist
    */
   Optional<String> metadataLocation(TableIdentifier identifier);
+
+  /**
+   * Creates a namespace and its Gravitino schema entity in one transaction (design doc section
+   * 5.11).
+   *
+   * @param request the REST create request
+   * @return the created namespace with its stored properties
+   */
+  CreateNamespaceResponse createNamespace(CreateNamespaceRequest request);
+
+  /**
+   * Drops a namespace. The namespace must be empty.
+   *
+   * @param namespace the namespace to drop
+   */
+  void dropNamespace(Namespace namespace);
+
+  /**
+   * Loads a namespace.
+   *
+   * @param namespace the namespace
+   * @return the namespace with its properties
+   */
+  GetNamespaceResponse loadNamespace(Namespace namespace);
+
+  /**
+   * @param namespace the namespace
+   * @return whether the namespace exists
+   */
+  boolean namespaceExists(Namespace namespace);
+
+  /**
+   * Lists the namespaces directly under a parent namespace.
+   *
+   * @param parent the parent namespace, or the empty namespace for the top level
+   * @return the child namespaces
+   */
+  ListNamespacesResponse listNamespaces(Namespace parent);
+
+  /**
+   * Applies a REST namespace property update.
+   *
+   * @param namespace the namespace
+   * @param request the removals and updates
+   * @return the applied removals and the resulting properties
+   */
+  UpdateNamespacePropertiesResponse updateNamespaceProperties(
+      Namespace namespace, UpdateNamespacePropertiesRequest request);
 }

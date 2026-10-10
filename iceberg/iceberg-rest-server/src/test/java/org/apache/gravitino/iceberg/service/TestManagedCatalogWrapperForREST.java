@@ -128,6 +128,49 @@ public class TestManagedCatalogWrapperForREST {
   }
 
   @Test
+  public void testNamespaceOperationsDelegateToManagedOps() {
+    ManagedIcebergCatalogOps ops = mock(ManagedIcebergCatalogOps.class);
+    ManagedCatalogWrapperForREST wrapper = wrapperFor(ops);
+    Namespace namespace = Namespace.of("db");
+
+    org.apache.iceberg.rest.requests.CreateNamespaceRequest createRequest =
+        org.apache.iceberg.rest.requests.CreateNamespaceRequest.builder()
+            .withNamespace(namespace)
+            .build();
+    org.apache.iceberg.rest.responses.CreateNamespaceResponse created =
+        org.apache.iceberg.rest.responses.CreateNamespaceResponse.builder()
+            .withNamespace(namespace)
+            .build();
+    org.apache.iceberg.rest.responses.GetNamespaceResponse loaded =
+        org.apache.iceberg.rest.responses.GetNamespaceResponse.builder()
+            .withNamespace(namespace)
+            .build();
+    org.apache.iceberg.rest.responses.ListNamespacesResponse listed =
+        org.apache.iceberg.rest.responses.ListNamespacesResponse.builder().build();
+    org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse updated =
+        org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse.builder().build();
+
+    when(ops.createNamespace(createRequest)).thenReturn(created);
+    when(ops.namespaceExists(namespace)).thenReturn(true);
+    when(ops.loadNamespace(namespace)).thenReturn(loaded);
+    when(ops.listNamespaces(namespace)).thenReturn(listed);
+    when(ops.updateNamespaceProperties(eq(namespace), any())).thenReturn(updated);
+
+    assertSame(created, wrapper.createNamespace(createRequest));
+    assertTrue(wrapper.namespaceExists(namespace));
+    assertSame(loaded, wrapper.loadNamespace(namespace));
+    assertSame(listed, wrapper.listNamespace(namespace));
+    assertSame(
+        updated,
+        wrapper.updateNamespaceProperties(
+            namespace,
+            mock(org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest.class)));
+
+    wrapper.dropNamespace(namespace);
+    verify(ops).dropNamespace(namespace);
+  }
+
+  @Test
   public void testSdkCatalogIsNeverInitialized() {
     ManagedCatalogWrapperForREST wrapper = wrapperFor(mock(ManagedIcebergCatalogOps.class));
     assertThrows(UnsupportedOperationException.class, wrapper::getCatalog);

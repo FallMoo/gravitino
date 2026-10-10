@@ -33,14 +33,20 @@ import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.rest.requests.CreateNamespaceRequest;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
 import org.apache.iceberg.rest.requests.RegisterTableRequest;
 import org.apache.iceberg.rest.requests.RenameTableRequest;
+import org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest;
 import org.apache.iceberg.rest.requests.UpdateTableRequest;
+import org.apache.iceberg.rest.responses.CreateNamespaceResponse;
+import org.apache.iceberg.rest.responses.GetNamespaceResponse;
 import org.apache.iceberg.rest.responses.ImmutableLoadCredentialsResponse;
+import org.apache.iceberg.rest.responses.ListNamespacesResponse;
 import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadCredentialsResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
+import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -201,6 +207,37 @@ public class ManagedCatalogWrapperForREST extends CatalogWrapperForREST {
       TableIdentifier identifier, CredentialPrivilege privilege) {
     // Managed catalogs store no JDBC/S3 credentials to hand out; clients keep using their own.
     return ImmutableLoadCredentialsResponse.builder().build();
+  }
+
+  @Override
+  public CreateNamespaceResponse createNamespace(CreateNamespaceRequest request) {
+    return managedOps().createNamespace(request);
+  }
+
+  @Override
+  public void dropNamespace(Namespace namespace) {
+    managedOps().dropNamespace(namespace);
+  }
+
+  @Override
+  public GetNamespaceResponse loadNamespace(Namespace namespace) {
+    return managedOps().loadNamespace(namespace);
+  }
+
+  @Override
+  public boolean namespaceExists(Namespace namespace) {
+    return managedOps().namespaceExists(namespace);
+  }
+
+  @Override
+  public ListNamespacesResponse listNamespace(Namespace parent) {
+    return managedOps().listNamespaces(parent);
+  }
+
+  @Override
+  public UpdateNamespacePropertiesResponse updateNamespaceProperties(
+      Namespace namespace, UpdateNamespacePropertiesRequest request) {
+    return managedOps().updateNamespaceProperties(namespace, request);
   }
 
   @Override

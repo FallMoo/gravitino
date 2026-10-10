@@ -134,6 +134,17 @@ public class ManagedIcebergMetadataStore {
       "SELECT DISTINCT namespace FROM iceberg_namespace_properties"
           + " WHERE catalog_name = ? AND (namespace = ? OR namespace LIKE ? ESCAPE '!')";
 
+  private static final String SELECT_ALL_NAMESPACES =
+      "SELECT DISTINCT namespace FROM iceberg_namespace_properties WHERE catalog_name = ?"
+          + " UNION SELECT DISTINCT table_namespace FROM iceberg_tables WHERE catalog_name = ?";
+
+  private static final String COUNT_TABLES_IN_NAMESPACE =
+      "SELECT COUNT(*) FROM iceberg_tables WHERE catalog_name = ? AND table_namespace = ?";
+
+  private static final String UPDATE_NAMESPACE_PROPERTY =
+      "UPDATE iceberg_namespace_properties SET property_value = ?"
+          + " WHERE catalog_name = ? AND namespace = ? AND property_key = ?";
+
   private static final String INSERT_NAMESPACE_PROPERTY =
       "INSERT INTO iceberg_namespace_properties"
           + " (catalog_name, namespace, property_key, property_value) VALUES (?, ?, ?, ?)";
@@ -458,6 +469,61 @@ public class ManagedIcebergMetadataStore {
       }
     }
     return namespaces;
+  }
+
+  /**
+   * Lists every namespace that has properties or tables. Namespace existence in Iceberg's JDBC
+   * backend is derived from both tables, so a listing that only looked at the properties table
+   * would hide namespaces created implicitly by a table.
+   *
+   * @param connection the transaction-bound connection
+   * @return the dotted namespace strings
+   * @throws SQLException if the statement fails
+   */
+  public List<String> listAllNamespaces(Connection connection) throws SQLException {
+    List<String> namespaces = new ArrayList<>();
+    try (PreparedStatement statement = connection.prepareStatement(SELECT_ALL_NAMESPACES)) {
+      statement.setString(1, catalogName);
+      statement.setString(2, catalogName);
+      try (ResultSet rs = statement.executeQuery()) {
+        while (rs.next()) {
+          namespaces.add(rs.getString(1));
+        }
+      }
+    }
+    return namespaces;
+  }
+
+  /**
+   * @param connection the transaction-bound connection
+   * @param namespace the dotted namespace string
+   * @return the number of tables directly in the namespace
+   * @throws SQLException if the statement fails
+   */
+  public int countTables(Connection connection, String namespace) throws SQLException {
+    try (PreparedStatement statement = connection.prepareStatement(COUNT_TABLES_IN_NAMESPACE)) {
+      statement.setString(1, catalogName);
+      statement.setString(2, namespace);
+      try (ResultSet rs = statement.executeQuery()) {
+        return rs.next() ? rs.getInt(1) : 0;
+      }
+    }
+  }
+
+  /**
+   * Updates a single namespace property.
+   *
+   * @return the number of updated rows, {@code 0} when the key did not exist
+   */
+  public int updateNamespaceProperty(
+      Connection connection, String namespace, String key, String value) throws SQLException {
+    try (PreparedStatement statement = connection.prepareStatement(UPDATE_NAMESPACE_PROPERTY)) {
+      statement.setString(1, value);
+      statement.setString(2, catalogName);
+      statement.setString(3, namespace);
+      statement.setString(4, key);
+      return statement.executeUpdate();
+    }
   }
 
   /**
