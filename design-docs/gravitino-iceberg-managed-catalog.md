@@ -620,7 +620,7 @@ try {
 ManagedIcebergCatalogOperations.createTable(ident, columns, comment, properties, partitions, ...)
   ├─ 校验 schema 存在（entity store）
   ├─ md = TableMetadata.newTableMetadata(schema, spec, sortOrder, location, properties)   // SDK，纯函数
-  ├─ location = writeMetadata(md, 1)                                                      // SDK，文件 I/O
+  ├─ location = writeMetadata(md, 0)   // 与 Iceberg 一致：首个元数据文件是版本 0         // SDK，文件 I/O
   ├─ SessionUtils.beginTransaction()
   │    ├─ INSERT INTO iceberg_tables (..., metadata_location = location, ..., 'TABLE')     // 0 行 → CommitFailedException
   │    └─ super.createTable(...)  → store.put(TableEntity)                                 // 嵌套 session

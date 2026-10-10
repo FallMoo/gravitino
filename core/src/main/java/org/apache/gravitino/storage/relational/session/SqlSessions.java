@@ -20,6 +20,7 @@
 package org.apache.gravitino.storage.relational.session;
 
 import com.google.common.annotations.VisibleForTesting;
+import java.sql.Connection;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.ibatis.session.SqlSession;
 import org.apache.ibatis.session.TransactionIsolationLevel;
@@ -101,6 +102,20 @@ public final class SqlSessions {
   public static <T> T getMapper(Class<T> className) {
     // getSqlSession() is called to ensure a session exists and increment the count.
     return getSqlSession().getMapper(className);
+  }
+
+  /**
+   * Get the JDBC connection bound to the current thread's transaction, if any.
+   *
+   * <p>Unlike {@link #getSqlSession()}, this does not increment the session reference count. It is
+   * meant for modules outside the entity store (for example a catalog implementation that has to
+   * run its own SQL inside the Gravitino transaction) and for tests that only observe the binding.
+   *
+   * @return the thread-bound connection, or {@code null} when no session is bound to this thread
+   */
+  public static Connection getBoundConnection() {
+    SqlSession sqlSession = sessions.get();
+    return sqlSession == null ? null : sqlSession.getConnection();
   }
 
   private static void handleSessionClose(boolean commit, boolean rollback) {

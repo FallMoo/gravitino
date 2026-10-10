@@ -24,6 +24,13 @@ public class IcebergConstants {
   public static final String CATALOG_BACKEND = "catalog-backend";
   public static final String CATALOG_BACKEND_IMPL = "catalog-backend-impl";
 
+  /**
+   * Selects whether the Iceberg catalog is a proxy over an external metastore ({@code federated},
+   * the default) or is managed by Gravitino itself ({@code managed}). Only legal together with
+   * {@code catalog-backend = jdbc}.
+   */
+  public static final String CATALOG_BACKEND_MODE = "catalog-backend-mode";
+
   public static final String GRAVITINO_JDBC_USER = "jdbc-user";
   public static final String ICEBERG_JDBC_USER = "jdbc.user";
 

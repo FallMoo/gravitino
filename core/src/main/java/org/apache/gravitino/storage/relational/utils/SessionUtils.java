@@ -19,6 +19,7 @@
 
 package org.apache.gravitino.storage.relational.utils;
 
+import java.sql.Connection;
 import java.util.Arrays;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -105,6 +106,27 @@ public class SessionUtils {
       SqlSessions.rollbackAndCloseSqlSession();
       throw t;
     }
+  }
+
+  /**
+   * Returns the JDBC connection bound to the transaction on the current thread.
+   *
+   * <p>Every SQL statement that must take part in the Gravitino transaction - including the Iceberg
+   * {@code iceberg_tables} row written by managed mode - has to run on this connection. This method
+   * does not change the session reference count, so it is safe to call it while a transaction is
+   * open.
+   *
+   * @return the connection bound to the current thread's transaction
+   * @throws IllegalStateException if no transaction is active on this thread
+   */
+  public static Connection currentConnection() {
+    Connection connection = SqlSessions.getBoundConnection();
+    if (connection == null) {
+      throw new IllegalStateException(
+          "No Gravitino transaction is bound to the current thread. Call"
+              + " SessionUtils.beginTransaction() before running transactional SQL.");
+    }
+    return connection;
   }
 
   public static void beginTransaction() {

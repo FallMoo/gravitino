@@ -22,12 +22,14 @@ import java.util.List;
 import java.util.Map;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.gravitino.annotation.Evolving;
+import org.apache.gravitino.catalog.lakehouse.iceberg.managed.IcebergManagedCatalogPrerequisites;
 import org.apache.gravitino.connector.BaseCatalog;
 import org.apache.gravitino.connector.CatalogOperations;
 import org.apache.gravitino.connector.PropertiesMetadata;
 import org.apache.gravitino.connector.capability.Capability;
 import org.apache.gravitino.credential.CredentialConstants;
 import org.apache.gravitino.credential.JdbcCredential;
+import org.apache.gravitino.meta.CatalogEntity;
 import org.apache.gravitino.rel.ViewCatalog;
 import org.apache.gravitino.utils.HierarchicalSchemaUtil;
 
@@ -36,6 +38,8 @@ public class IcebergCatalog extends BaseCatalog<IcebergCatalog> {
 
   static final IcebergCatalogPropertiesMetadata CATALOG_PROPERTIES_META =
       new IcebergCatalogPropertiesMetadata();
+
+  private volatile boolean prerequisitesChecked = false;
 
   static final IcebergSchemaPropertiesMetadata SCHEMA_PROPERTIES_META =
       new IcebergSchemaPropertiesMetadata();
@@ -70,7 +74,38 @@ public class IcebergCatalog extends BaseCatalog<IcebergCatalog> {
 
   @Override
   public Capability newCapability() {
-    return new IcebergCatalogCapability(HierarchicalSchemaUtil.schemaSeparator());
+    return new IcebergCatalogCapability(HierarchicalSchemaUtil.schemaSeparator(), backendMode());
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * <p>Managed mode additionally validates its fail-fast preconditions here (design doc section
+   * 5.2). This method is called while the catalog wrapper is built, both when the catalog is
+   * created and whenever the wrapper is rebuilt, so an illegal configuration or a runtime that
+   * cannot support managed mode is rejected before any operation runs. Federated mode only keeps
+   * the pre-existing {@code uri} requirement.
+   */
+  @Override
+  public Map<String, String> properties() {
+    Map<String, String> properties = super.properties();
+    if (!prerequisitesChecked) {
+      synchronized (this) {
+        if (!prerequisitesChecked) {
+          IcebergManagedCatalogPrerequisites.validate(properties);
+          prerequisitesChecked = true;
+        }
+      }
+    }
+    return properties;
+  }
+
+  private IcebergCatalogBackendMode backendMode() {
+    CatalogEntity entity = entity();
+    if (entity == null) {
+      return IcebergCatalogBackendMode.FEDERATED;
+    }
+    return IcebergCatalogBackendMode.fromProperties(entity.getProperties());
   }
 
   @Override

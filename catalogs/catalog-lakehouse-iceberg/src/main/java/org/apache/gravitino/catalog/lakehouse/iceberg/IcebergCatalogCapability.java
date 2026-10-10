@@ -18,6 +18,7 @@
  */
 package org.apache.gravitino.catalog.lakehouse.iceberg;
 
+import com.google.common.base.Preconditions;
 import org.apache.gravitino.connector.capability.Capability;
 import org.apache.gravitino.connector.capability.CapabilityResult;
 import org.apache.gravitino.utils.HierarchicalSchemaUtil;
@@ -25,14 +26,43 @@ import org.apache.gravitino.utils.HierarchicalSchemaUtil;
 public class IcebergCatalogCapability implements Capability {
 
   private final String schemaSeparator;
+  private final IcebergCatalogBackendMode mode;
 
   /**
-   * Creates a capability with the given external schema separator.
+   * Creates a capability with the given external schema separator, defaulting to {@link
+   * IcebergCatalogBackendMode#FEDERATED}.
    *
    * @param schemaSeparator the external separator used in logical schema names (e.g. {@code ":"})
    */
   public IcebergCatalogCapability(String schemaSeparator) {
-    this.schemaSeparator = schemaSeparator;
+    this(schemaSeparator, IcebergCatalogBackendMode.FEDERATED);
+  }
+
+  /**
+   * Creates a capability with the given external schema separator and catalog backend mode.
+   *
+   * @param schemaSeparator the external separator used in logical schema names (e.g. {@code ":"})
+   * @param mode the catalog backend mode; managed mode declares managed storage for TABLE/SCHEMA
+   */
+  public IcebergCatalogCapability(String schemaSeparator, IcebergCatalogBackendMode mode) {
+    this.schemaSeparator = Preconditions.checkNotNull(schemaSeparator, "schemaSeparator is null");
+    this.mode = Preconditions.checkNotNull(mode, "mode is null");
+  }
+
+  /**
+   * {@inheritDoc}
+   *
+   * <p>In managed mode Gravitino owns the table and schema entities, so the dispatchers must skip
+   * their own {@code store.put} and let the catalog implementation layer write them inside the same
+   * transaction as the Iceberg metadata row.
+   */
+  @Override
+  public CapabilityResult managedStorage(Scope scope) {
+    if (mode == IcebergCatalogBackendMode.MANAGED
+        && (scope == Scope.TABLE || scope == Scope.SCHEMA)) {
+      return CapabilityResult.SUPPORTED;
+    }
+    return Capability.super.managedStorage(scope);
   }
 
   @Override

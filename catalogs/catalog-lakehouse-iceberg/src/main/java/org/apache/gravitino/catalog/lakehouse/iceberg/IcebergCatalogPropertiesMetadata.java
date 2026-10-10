@@ -21,7 +21,6 @@ package org.apache.gravitino.catalog.lakehouse.iceberg;
 import static org.apache.gravitino.connector.PropertyEntry.enumImmutablePropertyEntry;
 import static org.apache.gravitino.connector.PropertyEntry.integerOptionalPropertyEntry;
 import static org.apache.gravitino.connector.PropertyEntry.stringOptionalPropertyEntry;
-import static org.apache.gravitino.connector.PropertyEntry.stringRequiredPropertyEntry;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -41,6 +40,7 @@ import org.apache.gravitino.iceberg.common.cache.LocalTableMetadataCache;
 
 public class IcebergCatalogPropertiesMetadata extends BaseCatalogPropertiesMetadata {
   public static final String CATALOG_BACKEND = IcebergConstants.CATALOG_BACKEND;
+  public static final String CATALOG_BACKEND_MODE = IcebergConstants.CATALOG_BACKEND_MODE;
   public static final String GRAVITINO_JDBC_USER = IcebergConstants.GRAVITINO_JDBC_USER;
   public static final String GRAVITINO_JDBC_PASSWORD = IcebergConstants.GRAVITINO_JDBC_PASSWORD;
   public static final String WAREHOUSE = IcebergConstants.WAREHOUSE;
@@ -72,8 +72,26 @@ public class IcebergCatalogPropertiesMetadata extends BaseCatalogPropertiesMetad
                 null /* defaultValue */,
                 false /* hidden */,
                 false /* reserved */),
-            stringRequiredPropertyEntry(
-                URI, "Iceberg catalog uri config", false /* immutable */, false /* hidden */),
+            // `uri` is optional at the property-entry level because managed mode does not use it.
+            // Federated mode still requires it; that is enforced at catalog creation by
+            // IcebergManagedCatalogPrerequisites (design doc section 5.2).
+            stringOptionalPropertyEntry(
+                URI,
+                "Iceberg catalog uri config. Required when catalog-backend-mode is federated"
+                    + " (the default); unused in managed mode.",
+                false /* immutable */,
+                null /* defaultValue */,
+                false /* hidden */),
+            enumImmutablePropertyEntry(
+                CATALOG_BACKEND_MODE,
+                "Whether Gravitino proxies Iceberg (federated, the default) or manages the catalog"
+                    + " itself (managed). Managed mode requires catalog-backend = jdbc and the"
+                    + " Iceberg REST service to run in auxiliary mode.",
+                false /* required */,
+                IcebergCatalogBackendMode.class,
+                IcebergCatalogBackendMode.FEDERATED /* defaultValue */,
+                false /* hidden */,
+                false /* reserved */),
             stringOptionalPropertyEntry(
                 WAREHOUSE,
                 "Iceberg catalog warehouse config",
