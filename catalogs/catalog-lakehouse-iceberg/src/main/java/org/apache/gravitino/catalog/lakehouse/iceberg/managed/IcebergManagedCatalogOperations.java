@@ -184,9 +184,7 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
 
   @Override
   public Table loadTable(NameIdentifier ident) throws NoSuchTableException {
-    ManagedIcebergMetadataStore.TableRow row = selectTableRowOrThrow(ident);
-    TableMetadata metadata = TableMetadataParser.read(fileIO, row.metadataLocation());
-    return IcebergTable.fromIcebergTable(metadata, ident.name());
+    return IcebergTable.fromIcebergTable(readMetadata(ident), ident.name());
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -246,6 +244,60 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
         TableMetadata.newTableMetadata(
             request.schema(), spec, writeOrder, location, request.properties());
 
+    return persistNewTable(
+        ident,
+        metadata,
+        columns,
+        comment,
+        effectiveProperties,
+        partitioning,
+        distribution,
+        sortOrders,
+        indexes);
+  }
+
+  /**
+   * Persists an already built {@link TableMetadata} as a brand new managed table (used by the
+   * {@code isCreate} commit branch, where the metadata comes from applying the REST updates to an
+   * empty base). Writes metadata version 0 and stores the Iceberg row and the Gravitino entity in
+   * one transaction.
+   *
+   * @param ident the table identifier
+   * @param metadata the metadata to persist
+   * @param properties the Gravitino properties (a string identifier is injected when missing)
+   * @return the created table
+   * @throws TableAlreadyExistsException if the table already exists
+   */
+  public Table createTableFromMetadata(
+      NameIdentifier ident, TableMetadata metadata, Map<String, String> properties)
+      throws TableAlreadyExistsException {
+    NameIdentifier schemaIdent = schemaIdentifierOf(ident);
+    if (!schemas().schemaExists(schemaIdent)) {
+      throw new NoSuchSchemaException("Schema %s does not exist", schemaIdent);
+    }
+    IcebergTable table = IcebergTable.fromIcebergTable(metadata, ident.name());
+    return persistNewTable(
+        ident,
+        metadata,
+        table.columns(),
+        table.comment(),
+        ensureStringIdentifier(properties),
+        table.partitioning(),
+        table.distribution(),
+        table.sortOrder(),
+        new Index[0]);
+  }
+
+  private Table persistNewTable(
+      NameIdentifier ident,
+      TableMetadata metadata,
+      Column[] columns,
+      String comment,
+      Map<String, String> effectiveProperties,
+      Transform[] partitioning,
+      Distribution distribution,
+      SortOrder[] sortOrders,
+      Index[] indexes) {
     // Iceberg numbers the very first metadata file as version 0; later commits advance from the
     // version parsed out of the current metadata file name (design doc section 5.5).
     ManagedIcebergMetadataStore.MetadataWriteResult write =
@@ -417,7 +469,42 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
    * @throws NoSuchTableException if the table does not exist
    * @throws CommitFailedException if the metadata pointer changed concurrently
    */
-  public Table commit(NameIdentifier ident, TableMetadata base, TableMetadata updated)
+  public TableMetadata commit(NameIdentifier ident, TableMetadata base, TableMetadata updated)
+      throws NoSuchTableException, CommitFailedException {
+    return commitInternal(ident, base, updated, true /* syncEntity */);
+  }
+
+  /**
+   * The data-only commit (design doc section 5.9.3): updates that only advance the data version
+   * (snapshots, statistics, encryption keys) move the {@code iceberg_tables} pointer without
+   * touching {@code table_meta}.
+   *
+   * @param ident the table identifier
+   * @param base the metadata the caller based its update on
+   * @param updated the new metadata
+   * @return the committed metadata
+   * @throws NoSuchTableException if the table does not exist
+   * @throws CommitFailedException if the metadata pointer changed concurrently
+   */
+  public TableMetadata commitDataOnly(
+      NameIdentifier ident, TableMetadata base, TableMetadata updated)
+      throws NoSuchTableException, CommitFailedException {
+    return commitInternal(ident, base, updated, false /* syncEntity */);
+  }
+
+  /**
+   * Reads the current metadata of a managed table.
+   *
+   * @param ident the table identifier
+   * @return the metadata stored at the current {@code iceberg_tables} pointer
+   * @throws NoSuchTableException if the table does not exist
+   */
+  public TableMetadata readMetadata(NameIdentifier ident) throws NoSuchTableException {
+    return TableMetadataParser.read(fileIO, selectTableRowOrThrow(ident).metadataLocation());
+  }
+
+  private TableMetadata commitInternal(
+      NameIdentifier ident, TableMetadata base, TableMetadata updated, boolean syncEntity)
       throws NoSuchTableException, CommitFailedException {
     String tableNamespace =
         schemaNameToTableNamespace(ident.namespace().level(ident.namespace().length() - 1));
@@ -446,7 +533,9 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
             // Layer 2: the conditional UPDATE; 0 rows means a concurrent writer won the race.
             metadataStore.commitTableLocation(
                 connection, tableNamespace, ident.name(), expectedLocation, write.location());
-            updateTableEntity(ident, entity -> toTableEntity(entity, ident, updated));
+            if (syncEntity) {
+              updateTableEntity(ident, entity -> toTableEntity(entity, ident, updated));
+            }
             return null;
           });
       persisted = true;
@@ -458,8 +547,7 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
       }
     }
 
-    return IcebergTable.fromIcebergTable(
-        TableMetadataParser.read(fileIO, write.location()), ident.name());
+    return TableMetadataParser.read(fileIO, write.location());
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -578,7 +666,7 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
     return String.join(".", IcebergCatalogWrapperHelper.getIcebergNamespace(schemaName).levels());
   }
 
-  private String defaultTableLocation(NameIdentifier ident) {
+  String defaultTableLocation(NameIdentifier ident) {
     String tableNamespace =
         schemaNameToTableNamespace(ident.namespace().level(ident.namespace().length() - 1));
     return String.format(

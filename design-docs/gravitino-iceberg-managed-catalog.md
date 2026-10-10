@@ -741,6 +741,8 @@ ManagedIcebergCommitHandler.commit(ident, UpdateTableRequest request)
 
 结论不变（不得 `.executeWith`、自研重试也必须同线程），但实现者应按上面三条来评估风险，而不是假设两个 store 一定会分裂。
 
+**requirement 校验失败不得重试（实现细节）。** Iceberg 把校验失败包成包级私有的 `CatalogHandlers.ValidationFailureException`，正是为了让 `onlyRetryOn(CommitFailedException.class)` 不重试它。该类型无法从 Gravitino 复用，因此 `ManagedIcebergCommitHandler` 用等价的公开 `ValidationFailure`（内部持有原始 `CommitFailedException`）承载，语义不变：不重试、REST 层映射为冲突。另外 `isCreate` 分支（requirements 含 `AssertTableDoesNotExist`）按 `CatalogHandlers.create` 的语义实现：requirements 对**空 base** 校验，updates 应用到 `TableMetadata.buildFromEmpty(formatVersion)`，随后作为新表落库。
+
 #### 5.9.2 Gravitino native 入口（第五阶段）
 
 `TableOperationDispatcher` 把 Gravitino 的 `Column[]` / `TableChange[]` 翻译成 §5.8 的原语。由于 managed capability 让 dispatcher 跳过自己的 `store.put`（`TableOperationDispatcher.java:660-667`），实体写入由实现层完成。
@@ -755,20 +757,24 @@ ManagedIcebergCommitHandler.commit(ident, UpdateTableRequest request)
 
 | 类别 | update 类型 | 影响 Gravitino 实体内容？ |
 | --- | --- | --- |
-| 结构 | `AddSchema`、`SetCurrentSchema`、`RemoveSchemas` | **是** → `table_meta.columns` |
+| 结构（列） | `AddSchema`、`SetCurrentSchema`、`RemoveSchemas` | **是** → `table_meta.columns` |
+| 结构（分区 / 排序） | `AddPartitionSpec`、`RemovePartitionSpecs`、`SetDefaultPartitionSpec`、`AddSortOrder`、`SetDefaultSortOrder` | **是** → `table_meta` 的 partitioning / sortOrders |
 | 属性 / 位置 | `SetProperties`、`RemoveProperties`、`SetLocation` | **是** → `table_version_info.properties` |
 | 格式 | `UpgradeFormatVersion`、`AssignUUID` | **是** → `table_version_info.format` |
 | 数据版本 | `AddSnapshot`、`SetSnapshotRef`、`RemoveSnapshots`、`RemoveSnapshotRef` | 否 |
 | 统计 | `SetStatistics`、`RemoveStatistics`、`SetPartitionStatistics`、`RemovePartitionStatistics` | 否 |
 | 加密密钥 | `AddEncryptionKey`、`RemoveEncryptionKey` | 否 |
+| 视图专属 | `AddViewVersion`、`SetCurrentViewVersion` | 否（本次范围不含视图，见 §3） |
+
+上表是对 Iceberg 1.11.0 的 `MetadataUpdate` **全部 25 个子类**的显式归类（R10）；实现中用白名单落在 `ManagedIcebergCommitHandler`，并由 `TestMetadataUpdateClassification` 反射枚举全部子类，新增子类时测试失败。注意**分区与排序变更也属于"影响实体内容"**——原表把它们漏掉了。
 
 Iceberg 客户端的 commit 就是这样产生的：`RESTTableOperations.commit` 用 `metadata.changes()` 作为 `updates`（`RESTTableOperations.java:161-180`，`TableMetadata.changes()` 在 `TableMetadata.java:586`）。**Spark 执行 `ALTER TABLE ... ADD COLUMN` 走的正是这个端点。**
 
 因此规则是：
 
 > REST commit 检查 `request.updates()`：
-> * 含**结构 / 属性 / 格式**类 update → 开启 Gravitino 事务，同时更新 `iceberg_tables` 与 `table_meta`；
-> * 只含 **snapshot / statistics / encryption** 类 update → 只做一条 `UPDATE iceberg_tables`，由 SQL 乐观并发保证正确性，不动 `table_meta`。
+> * 含**结构（列 / 分区 / 排序）/ 属性 / 格式**类 update → 开启 Gravitino 事务，同时更新 `iceberg_tables` 与 `table_meta`（`IcebergManagedCatalogOperations.commit`）；
+> * 只含 **snapshot / statistics / encryption / 视图** 类 update → 只做一条 `UPDATE iceberg_tables`，由 SQL 乐观并发保证正确性，不动 `table_meta`（`IcebergManagedCatalogOperations.commitDataOnly`）。
 
 这样两个入口在 `table_meta` 上的语义完全一致：**凡是改变"结构 / 属性"的操作都同步；只改变"数据版本"的操作不同步。**
 

@@ -40,6 +40,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.reflect.FieldUtils;
@@ -464,8 +465,8 @@ public class TestIcebergManagedCatalogOperations {
             NestedField.optional(3, "extra", org.apache.iceberg.types.Types.StringType.get()));
     TableMetadata updated = base.updateSchema(newSchema);
 
-    Table committed = ops.commit(ident, base, updated);
-    assertEquals(3, committed.columns().length);
+    TableMetadata committed = ops.commit(ident, base, updated);
+    assertEquals(3, committed.schema().columns().size());
 
     String newLocation = selectMetadataLocation("t_commit").orElseThrow();
     assertEquals(
@@ -500,5 +501,165 @@ public class TestIcebergManagedCatalogOperations {
     assertFalse(
         ops.dropTable(tableIdent("t_renamed")), "dropping a missing table must return false");
     assertNull(selectMetadataLocation("t_renamed").orElse(null));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Commit handler (design doc sections 5.9.1 / 5.9.3 and tests 10, 11, 14)
+  // ---------------------------------------------------------------------------------------------
+
+  private static final class CountingCommitOps extends IcebergManagedCatalogOperations {
+    private final AtomicInteger commitAttempts = new AtomicInteger();
+    private final AtomicInteger readAttempts = new AtomicInteger();
+    private final boolean failFirstCommit;
+    private final boolean alwaysFail;
+
+    private CountingCommitOps(boolean failFirstCommit, boolean alwaysFail) {
+      this.failFirstCommit = failFirstCommit;
+      this.alwaysFail = alwaysFail;
+    }
+
+    @Override
+    public TableMetadata readMetadata(NameIdentifier ident) throws NoSuchTableException {
+      readAttempts.incrementAndGet();
+      return super.readMetadata(ident);
+    }
+
+    @Override
+    public TableMetadata commit(NameIdentifier ident, TableMetadata base, TableMetadata updated) {
+      int attempt = commitAttempts.incrementAndGet();
+      if (alwaysFail) {
+        throw new org.apache.iceberg.exceptions.CommitFailedException(
+            "simulated permanent concurrent writer");
+      }
+      if (failFirstCommit && attempt == 1) {
+        // Simulate another writer winning the race with an unrelated change, so the retry still has
+        // real work to do and the handler has to re-read the base.
+        super.commit(ident, base, base.replaceProperties(Map.of("concurrent", "writer")));
+        throw new org.apache.iceberg.exceptions.CommitFailedException(
+            "simulated concurrent writer");
+      }
+      return super.commit(ident, base, updated);
+    }
+  }
+
+  private static <T extends IcebergManagedCatalogOperations> T newOpsOfType(
+      java.util.function.Supplier<T> supplier) {
+    T ops = supplier.get();
+    ops.initialize(conf(), null, null);
+    return ops;
+  }
+
+  private static Map<String, String> conf() {
+    return ImmutableMap.<String, String>builder()
+        .put(IcebergConstants.CATALOG_BACKEND_MODE, "managed")
+        .put(IcebergConstants.CATALOG_BACKEND, "jdbc")
+        .put(IcebergConstants.WAREHOUSE, warehouseDir.toUri().toString())
+        .put(IcebergConstants.CATALOG_BACKEND_NAME, ICEBERG_CATALOG_NAME)
+        .build();
+  }
+
+  private static org.apache.iceberg.rest.requests.UpdateTableRequest setPropertyRequest(
+      NameIdentifier ident, TableMetadata base, String key, String value) {
+    return org.apache.iceberg.rest.requests.UpdateTableRequest.create(
+        org.apache.gravitino.catalog.lakehouse.iceberg.ops.IcebergCatalogWrapperHelper
+            .buildIcebergTableIdentifier(ident),
+        java.util.List.of(new org.apache.iceberg.UpdateRequirement.AssertTableUUID(base.uuid())),
+        java.util.List.of(new org.apache.iceberg.MetadataUpdate.SetProperties(Map.of(key, value))));
+  }
+
+  @Test
+  public void testCommitHandlerRetriesAfterAConcurrentWriter() throws Exception {
+    CountingCommitOps ops = newOpsOfType(() -> new CountingCommitOps(true, false));
+    NameIdentifier ident = tableIdent("t_retry");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    TableMetadata base = ops.readMetadata(ident);
+    TableMetadata result =
+        new ManagedIcebergCommitHandler(ops)
+            .commit(ident, setPropertyRequest(ident, base, "retried", "true"));
+    // Snapshot the counter before the assertions below read the metadata again.
+    int readsByHandler = ops.readAttempts.get() - 1 /* the read above */;
+
+    assertEquals(2, readsByHandler, "the handler must re-read the base on retry");
+    assertEquals(2, ops.commitAttempts.get(), "the handler must retry exactly once");
+    assertEquals("true", result.properties().get("retried"), "the retry lost the update");
+    assertEquals(
+        "writer",
+        result.properties().get("concurrent"),
+        "the retry must build on the winner's metadata");
+    assertEquals(
+        "true",
+        ops.readMetadata(ident).properties().get("retried"),
+        "the committed metadata is missing the retried property");
+    assertEquals(1L, countTableMetaRows("t_retry"), "table_meta disappeared");
+  }
+
+  @Test
+  public void testCommitHandlerGivesUpAfterRetries() throws Exception {
+    CountingCommitOps ops = newOpsOfType(() -> new CountingCommitOps(false, true));
+    NameIdentifier ident = tableIdent("t_exhausted");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    TableMetadata base = ops.readMetadata(ident);
+    org.apache.iceberg.rest.requests.UpdateTableRequest request =
+        setPropertyRequest(ident, base, "exhausted", "true");
+
+    assertThrows(
+        org.apache.iceberg.exceptions.CommitFailedException.class,
+        () -> new ManagedIcebergCommitHandler(ops).commit(ident, request));
+    assertEquals(5, ops.commitAttempts.get(), "expected 1 attempt plus 4 retries");
+    assertFalse(
+        ops.readMetadata(ident).properties().containsKey("exhausted"),
+        "a failed commit must not move the pointer");
+  }
+
+  @Test
+  public void testCommitHandlerDoesNotRetryAValidationFailure() throws Exception {
+    CountingCommitOps ops = newOpsOfType(() -> new CountingCommitOps(false, false));
+    NameIdentifier ident = tableIdent("t_validation");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    TableMetadata base = ops.readMetadata(ident);
+    org.apache.iceberg.rest.requests.UpdateTableRequest request =
+        org.apache.iceberg.rest.requests.UpdateTableRequest.create(
+            org.apache.gravitino.catalog.lakehouse.iceberg.ops.IcebergCatalogWrapperHelper
+                .buildIcebergTableIdentifier(ident),
+            java.util.List.of(
+                new org.apache.iceberg.UpdateRequirement.AssertTableUUID("not-the-uuid")),
+            java.util.List.of(
+                new org.apache.iceberg.MetadataUpdate.SetProperties(Map.of("k", "v"))));
+
+    assertThrows(
+        ManagedIcebergCommitHandler.ValidationFailure.class,
+        () -> new ManagedIcebergCommitHandler(ops).commit(ident, request));
+    assertEquals(0, ops.commitAttempts.get(), "a validation failure must not be retried");
+    assertEquals(
+        base.metadataFileLocation(),
+        ops.readMetadata(ident).metadataFileLocation(),
+        "a validation failure must not write a new metadata file");
+  }
+
+  @Test
+  public void testDataOnlyCommitLeavesTheEntityUntouched() throws Exception {
+    IcebergManagedCatalogOperations ops = newOps();
+    NameIdentifier ident = tableIdent("t_data_only");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+
+    TableMetadata base = ops.readMetadata(ident);
+    ops.commitDataOnly(ident, base, base.replaceProperties(Map.of("data.only", "true")));
+
+    TableEntity afterDataOnly = store.get(ident, Entity.EntityType.TABLE, TableEntity.class);
+    assertFalse(
+        afterDataOnly.properties().containsKey("data.only"),
+        "a data-only commit must not synchronize table_meta");
+
+    TableMetadata second = ops.readMetadata(ident);
+    ops.commit(ident, second, second.replaceProperties(Map.of("structure.change", "true")));
+    assertTrue(
+        store
+            .get(ident, Entity.EntityType.TABLE, TableEntity.class)
+            .properties()
+            .containsKey("structure.change"),
+        "a structure/property commit must synchronize table_meta");
   }
 }
