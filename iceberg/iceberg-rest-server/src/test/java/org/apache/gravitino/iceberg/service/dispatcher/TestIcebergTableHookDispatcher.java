@@ -19,6 +19,7 @@
 package org.apache.gravitino.iceberg.service.dispatcher;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -43,6 +44,7 @@ import org.apache.gravitino.authorization.OwnerDispatcher;
 import org.apache.gravitino.catalog.TableDispatcher;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.iceberg.common.utils.IcebergIdentifierUtils;
+import org.apache.gravitino.iceberg.service.IcebergCatalogWrapperManager;
 import org.apache.gravitino.iceberg.service.authorization.IcebergRESTServerContext;
 import org.apache.gravitino.iceberg.service.provider.IcebergConfigProvider;
 import org.apache.gravitino.listener.api.event.IcebergRequestContext;
@@ -81,6 +83,7 @@ public class TestIcebergTableHookDispatcher {
   private OwnerDispatcher mockOwnerDispatcher;
   private OwnerDispatcher mockInternalOwnerDispatcher;
   private IcebergRequestContext mockContext;
+  private IcebergConfigProvider mockConfigProvider;
 
   private Config previousConfig;
   private EntityStore previousEntityStore;
@@ -127,7 +130,7 @@ public class TestIcebergTableHookDispatcher {
         GravitinoEnv.getInstance(), "internalOwnerDispatcher", mockInternalOwnerDispatcher, true);
 
     // Create mock IcebergRESTServerContext
-    IcebergConfigProvider mockConfigProvider = mock(IcebergConfigProvider.class);
+    mockConfigProvider = mock(IcebergConfigProvider.class);
     when(mockConfigProvider.getMetalakeName()).thenReturn(TEST_METALAKE);
     when(mockConfigProvider.getDefaultCatalogName()).thenReturn(TEST_CATALOG);
     IcebergRESTServerContext.create(mockConfigProvider, false, false, true, null);
@@ -547,5 +550,64 @@ public class TestIcebergTableHookDispatcher {
     verify(mockTableDispatcher, never()).loadTable(any());
     verify(mockInternalOwnerDispatcher, never()).setOwner(any(), any(), any(), any());
     verify(mockOwnerDispatcher, never()).setOwner(any(), any(), any(), any());
+  }
+
+  @Test
+  public void testManagedCatalogSkipsEntityImportButKeepsOwnership() {
+    IcebergCatalogWrapperManager manager = mock(IcebergCatalogWrapperManager.class);
+    when(manager.isManagedCatalog(TEST_CATALOG)).thenReturn(true);
+    IcebergRESTServerContext.create(mockConfigProvider, false, false, true, manager);
+
+    Namespace namespace = Namespace.of("test_schema");
+    CreateTableRequest request =
+        CreateTableRequest.builder().withName("test_table").withSchema(TABLE_SCHEMA).build();
+    when(mockDispatcher.createTable(mockContext, namespace, request))
+        .thenReturn(mock(LoadTableResponse.class));
+
+    hookDispatcher.createTable(mockContext, namespace, request);
+
+    // The managed implementation layer already created the entity; the hook must not import it.
+    verify(mockInternalTableDispatcher, never()).loadTable(any());
+    // Ownership is an authorization concern and still runs.
+    verify(mockInternalOwnerDispatcher)
+        .setOwner(eq(TEST_METALAKE), any(), eq(TEST_USER), eq(Owner.Type.USER));
+  }
+
+  @Test
+  public void testManagedCatalogSkipsDropReconciliation() throws Exception {
+    IcebergCatalogWrapperManager manager = mock(IcebergCatalogWrapperManager.class);
+    when(manager.isManagedCatalog(TEST_CATALOG)).thenReturn(true);
+    IcebergRESTServerContext.create(mockConfigProvider, false, false, true, manager);
+
+    TableIdentifier identifier = TableIdentifier.of(Namespace.of("test_schema"), "test_table");
+    hookDispatcher.dropTable(mockContext, identifier, false);
+
+    verify(mockDispatcher).dropTable(mockContext, identifier, false);
+    // Managed mode deletes the row and the entity in one transaction: no reconciliation, no entity
+    // import, no entity delete from the hook.
+    verify(mockInternalTableDispatcher, never()).loadTable(any());
+    // Only the orphan-schema cleanup may touch the store; no table entity is deleted by the hook.
+    verify(mockEntityStore, never())
+        .delete(any(), eq(org.apache.gravitino.Entity.EntityType.TABLE), anyBoolean());
+  }
+
+  @Test
+  public void testManagedCatalogSkipsRenameEntityUpdate() throws Exception {
+    IcebergCatalogWrapperManager manager = mock(IcebergCatalogWrapperManager.class);
+    when(manager.isManagedCatalog(TEST_CATALOG)).thenReturn(true);
+    IcebergRESTServerContext.create(mockConfigProvider, false, false, true, manager);
+
+    Namespace namespace = Namespace.of("test_schema");
+    RenameTableRequest request =
+        RenameTableRequest.builder()
+            .withSource(TableIdentifier.of(namespace, "source_table"))
+            .withDestination(TableIdentifier.of(namespace, "dest_table"))
+            .build();
+
+    hookDispatcher.renameTable(mockContext, request);
+
+    verify(mockDispatcher).renameTable(mockContext, request);
+    verify(mockEntityStore, never()).update(any(), any(), any(), any());
+    verify(mockInternalTableDispatcher, never()).loadTable(any());
   }
 }

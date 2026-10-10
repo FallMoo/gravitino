@@ -28,6 +28,7 @@ import org.apache.gravitino.NameIdentifier;
 import org.apache.gravitino.catalog.TableDispatcher;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.iceberg.common.utils.IcebergIdentifierUtils;
+import org.apache.gravitino.iceberg.service.IcebergCatalogWrapperManager;
 import org.apache.gravitino.iceberg.service.authorization.IcebergRESTServerContext;
 import org.apache.gravitino.listener.api.event.IcebergRequestContext;
 import org.apache.gravitino.meta.AuditInfo;
@@ -100,10 +101,14 @@ public class IcebergTableHookDispatcher implements IcebergTableOperationDispatch
   public void dropTable(
       IcebergRequestContext context, TableIdentifier tableIdentifier, boolean purgeRequested) {
     dispatcher.dropTable(context, tableIdentifier, purgeRequested);
-    // Reconcile against Iceberg backend state — without a distributed TreeLock,
-    // another node may recreate the same table between the drop above and the
-    // EntityStore delete, leaving a stale Gravitino entity if we blindly delete.
-    bestEffortReconcileTableEntity(context, tableIdentifier);
+    if (!isManagedCatalog(context.catalogName())) {
+      // Reconcile against Iceberg backend state — without a distributed TreeLock,
+      // another node may recreate the same table between the drop above and the
+      // EntityStore delete, leaving a stale Gravitino entity if we blindly delete.
+      // Managed mode deletes the iceberg_tables row and the entity in one transaction, so there is
+      // nothing to reconcile.
+      bestEffortReconcileTableEntity(context, tableIdentifier);
+    }
     IcebergOrphanSchemaCleanup.bestEffortCleanUp(
         metalake, namespaceDispatcher, context, tableIdentifier.namespace());
   }
@@ -127,6 +132,11 @@ public class IcebergTableHookDispatcher implements IcebergTableOperationDispatch
   @Override
   public void renameTable(IcebergRequestContext context, RenameTableRequest renameTableRequest) {
     dispatcher.renameTable(context, renameTableRequest);
+    if (isManagedCatalog(context.catalogName())) {
+      // The managed implementation layer renames the iceberg_tables row and the entity in one
+      // transaction, so the hook has no entity work left to do (design doc section 5.3).
+      return;
+    }
     String separator = HierarchicalSchemaUtil.schemaSeparator();
     NameIdentifier tableSource =
         IcebergIdentifierUtils.toGravitinoTableIdentifier(
@@ -205,10 +215,21 @@ public class IcebergTableHookDispatcher implements IcebergTableOperationDispatch
 
   private void importTableAndSetOwner(
       IcebergRequestContext context, Namespace namespace, String tableName) {
+    if (isManagedCatalog(context.catalogName())) {
+      // In managed mode the implementation layer already created the Gravitino entity inside the
+      // same transaction as the iceberg_tables row (design doc sections 5.3 and 5.9.1), so the hook
+      // must not import it again. Ownership is still an authorization concern handled here.
+      setTableOwner(context, namespace, tableName);
+      return;
+    }
     // Import is intentionally NOT wrapped in try-catch: if it fails the table exists in Iceberg
     // but not in Gravitino, and silently swallowing that would mislead callers into thinking the
     // entity is registered. Surface the failure so the caller can react.
     importTableEntity(context.catalogName(), namespace, tableName);
+    setTableOwner(context, namespace, tableName);
+  }
+
+  private void setTableOwner(IcebergRequestContext context, Namespace namespace, String tableName) {
     IcebergOwnershipUtils.setTableOwner(
         metalake,
         context.catalogName(),
@@ -216,6 +237,12 @@ public class IcebergTableHookDispatcher implements IcebergTableOperationDispatch
         tableName,
         context.userName(),
         GravitinoEnv.getInstance().internalOwnerDispatcher());
+  }
+
+  private boolean isManagedCatalog(String catalogName) {
+    IcebergCatalogWrapperManager wrapperManager =
+        IcebergRESTServerContext.getInstance().catalogWrapperManager();
+    return wrapperManager != null && wrapperManager.isManagedCatalog(catalogName);
   }
 
   private void importTableEntity(String catalogName, Namespace namespace, String tableName) {

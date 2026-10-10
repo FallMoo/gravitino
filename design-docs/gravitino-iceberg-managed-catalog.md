@@ -412,7 +412,7 @@ IcebergCatalog.newCapability()
 | `ManagedIcebergCatalogOps`（`iceberg-common`） | REST 入口契约：用 Iceberg 类型表达的 create/load/update/register/list/exists/drop/rename/metadataLocation；由 `IcebergManagedCatalogOperations` 实现 |
 | `IcebergTableOperationExecutor`（改造） | Iceberg REST 入口适配器：把 REST 请求翻译成 §5.8 原语（经 `ManagedIcebergCatalogOps`） |
 | `TableOperationDispatcher`（改造） | Gravitino native 入口适配器（第五阶段） |
-| `IcebergTableHookDispatcher` 等 Hook 层 | managed 模式下不再承担实体写入（写入移入实现层）；保留授权相关职责 |
+| `IcebergTableHookDispatcher` 等 Hook 层 | managed 模式下不再承担实体写入（写入移入实现层）；保留授权相关职责。实现方式：`IcebergCatalogWrapperManager.isManagedCatalog(name)` 作为唯一判定入口，Hook 在 managed 时跳过 `importTableEntity` / drop 后 reconcile / rename 的实体搬迁，但**保留** `setTableOwner` 与 `IcebergOrphanSchemaCleanup`（授权与 schema 生命周期与写入归属无关） |
 | `IcebergCatalogWrapper` | 契约不变；managed 模式下读写都不再走 Iceberg 的 `JdbcCatalog` 与 `CatalogHandlers` |
 | `ManagedCatalogWrapperForREST`（`iceberg-rest-server`） | `CatalogWrapperForREST` 的 managed 子类：所有表操作委托给 `ManagedIcebergCatalogOps`，永不初始化 Iceberg SDK catalog |
 

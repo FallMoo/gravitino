@@ -179,6 +179,24 @@ public class TestIcebergCatalogWrapperManagerForREST {
     Assertions.assertFalse(wrapper instanceof ManagedCatalogWrapperForREST);
   }
 
+  @Test
+  public void testIsManagedCatalogReadsTheBackendMode() {
+    Map<String, String> config = Maps.newHashMap();
+    config.put("catalog.managed_catalog.catalog-backend", "jdbc");
+    config.put("catalog.managed_catalog.catalog-backend-mode", "managed");
+    config.put("catalog.managed_catalog.warehouse", "/tmp/managed-mode-test");
+    config.put("catalog.federated_catalog.catalog-backend", "jdbc");
+    config.put("catalog.federated_catalog.uri", "jdbc:mysql://localhost:3306/metastore");
+    IcebergConfigProvider configProvider = IcebergConfigProviderFactory.create(config);
+    configProvider.initialize(config);
+    IcebergCatalogWrapperManager manager =
+        new IcebergCatalogWrapperManager(
+            config, configProvider, false, configProvider.getMetalakeName());
+
+    Assertions.assertTrue(manager.isManagedCatalog("managed_catalog"));
+    Assertions.assertFalse(manager.isManagedCatalog("federated_catalog"));
+  }
+
   private static IcebergCatalogWrapperManager newManager() {
     Map<String, String> config = Maps.newHashMap();
     IcebergConfigProvider configProvider = IcebergConfigProviderFactory.create(config);

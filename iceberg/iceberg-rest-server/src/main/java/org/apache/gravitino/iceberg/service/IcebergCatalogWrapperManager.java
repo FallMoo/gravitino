@@ -156,6 +156,17 @@ public class IcebergCatalogWrapperManager implements AutoCloseable {
   }
 
   /**
+   * @param catalogName the catalog name
+   * @return whether the catalog is configured with {@code catalog-backend-mode=managed}
+   */
+  public boolean isManagedCatalog(String catalogName) {
+    return configProvider
+        .getIcebergCatalogConfig(catalogName)
+        .map(IcebergCatalogWrapperManager::isManagedBackendMode)
+        .orElse(false);
+  }
+
+  /**
    * @param icebergConfig the catalog configuration
    * @return whether the catalog is in managed backend mode
    */
