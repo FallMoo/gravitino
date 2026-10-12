@@ -264,15 +264,20 @@ public class TestIcebergManagedCatalogOperations {
         Statement statement = connection.createStatement()) {
       statement.execute("DELETE FROM iceberg_tables");
       statement.execute("DELETE FROM iceberg_namespace_properties");
+      // Namespace tests create schema entities; keep only the parent schema of this test class.
+      statement.execute("DELETE FROM schema_meta WHERE schema_name <> 'db'");
       statement.execute("DELETE FROM table_meta");
       statement.execute("DELETE FROM schema_meta");
       statement.execute("DELETE FROM catalog_meta");
       statement.execute("DELETE FROM metalake_meta");
     }
     // Each test gets a clean warehouse so orphan-file assertions cannot see another test's files.
-    Path warehouseTables = warehouseDir.resolve("db");
-    if (Files.exists(warehouseTables)) {
-      FileUtils.deleteDirectory(warehouseTables.toFile());
+    // The whole tree is cleared, not just the default namespace, because some tests create tables
+    // in
+    // other namespaces.
+    if (Files.exists(warehouseDir)) {
+      FileUtils.deleteDirectory(warehouseDir.toFile());
+      Files.createDirectories(warehouseDir);
     }
 
     insertEntity(metalakeEntity());
@@ -1309,5 +1314,78 @@ public class TestIcebergManagedCatalogOperations {
         3, store.get(nativeIdent, Entity.EntityType.TABLE, TableEntity.class).columns().size());
     assertEquals(
         3, store.get(restIdent, Entity.EntityType.TABLE, TableEntity.class).columns().size());
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Gravitino native schema entry (design phase 5, SupportsSchemas)
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testNativeSchemaEntryUsesTheSameNamespacePrimitives() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    NameIdentifier schemaIdent = NameIdentifier.of(METALAKE, CATALOG, "ns_native_schema");
+
+    org.apache.gravitino.Schema created =
+        ops.createSchema(schemaIdent, "native comment", Map.of("team", "lakehouse"));
+    assertEquals("native comment", created.comment());
+    assertEquals("lakehouse", created.properties().get("team"));
+    assertTrue(ops.schemaExists(schemaIdent));
+
+    // The Iceberg-side property rows and the Gravitino entity were written by the same call.
+    assertTrue(countNamespacePropertyRows("ns_native_schema") >= 2, "properties were not stored");
+    SchemaEntity entity = store.get(schemaIdent, Entity.EntityType.SCHEMA, SchemaEntity.class);
+    assertEquals("native comment", entity.comment());
+    assertEquals("lakehouse", entity.properties().get("team"));
+
+    assertEquals("lakehouse", ops.loadSchema(schemaIdent).properties().get("team"));
+    assertTrue(
+        java.util.Arrays.asList(ops.listSchemas(Namespace.of(METALAKE, CATALOG)))
+            .contains(schemaIdent),
+        "listSchemas must return the created schema");
+
+    org.apache.gravitino.Schema altered =
+        ops.alterSchema(
+            schemaIdent,
+            org.apache.gravitino.SchemaChange.setProperty("team", "data"),
+            org.apache.gravitino.SchemaChange.removeProperty("owner"));
+    assertEquals("data", altered.properties().get("team"));
+    assertFalse(altered.properties().containsKey("owner"));
+    assertEquals(
+        "data",
+        store
+            .get(schemaIdent, Entity.EntityType.SCHEMA, SchemaEntity.class)
+            .properties()
+            .get("team"),
+        "alterSchema must keep the entity in sync");
+
+    assertTrue(ops.dropSchema(schemaIdent, false));
+    assertFalse(ops.schemaExists(schemaIdent));
+    assertThrows(
+        NoSuchEntityException.class,
+        () -> store.get(schemaIdent, Entity.EntityType.SCHEMA, SchemaEntity.class));
+  }
+
+  @Test
+  public void testDropSchemaRejectsANonEmptySchemaUnlessCascading() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    NameIdentifier schemaIdent = NameIdentifier.of(METALAKE, CATALOG, "ns_native_full");
+    ops.createSchema(schemaIdent, null, Map.of());
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of("ns_native_full");
+    ops.createTable(namespace, restCreateRequest("t_in_native_schema", false));
+    NameIdentifier tableIdent =
+        NameIdentifier.of(METALAKE, CATALOG, "ns_native_full", "t_in_native_schema");
+
+    assertThrows(
+        org.apache.gravitino.exceptions.NonEmptySchemaException.class,
+        () -> ops.dropSchema(schemaIdent, false));
+    assertTrue(ops.schemaExists(schemaIdent), "a failed drop must keep the schema");
+    assertTrue(ops.tableExists(tableIdent), "a failed drop must keep the tables");
+
+    // Cascading drop is required by CatalogManager.dropCatalog for managed catalogs.
+    assertTrue(ops.dropSchema(schemaIdent, true));
+    assertFalse(ops.schemaExists(schemaIdent));
+    assertFalse(ops.tableExists(tableIdent));
+    assertEquals(0L, countIcebergRows("t_in_native_schema"));
   }
 }

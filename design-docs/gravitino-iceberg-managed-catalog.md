@@ -926,6 +926,9 @@ managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamesp
 * `TableOperationDispatcher` → 实现层的翻译：把 `TableChange` 映射改写为 `PendingUpdate.apply()` + `TableMetadata.updateXxx()`（§5.8.2）。实现上复用 `IcebergCatalogWrapperHelper.applyTableChanges` + 记录式载体（见 §5.8.2 的实施补充）。
 * 集成测试 8、12、17。
 * 附带：managed wrapper 支持 credential vending（§5.9 分层表说明），复用基类的凭证构造逻辑，`/credentials` 端点从实现层读取 metadata。
+* 附带：`IcebergManagedCatalogOperations` 实现 `connector.SupportsSchemas`。capability 既然声明了 `managedStorage(SCHEMA) = SUPPORTED`，native schema API（create/load/alter/list/exists/drop）就必须由实现层提供，否则 `CatalogWrapper.asSchemas()` 返回 null，native schema 路径直接抛"不支持 schema 操作"。实现直接复用 §5.11 的 namespace 原语：schema comment 与属性落到 `iceberg_namespace_properties` 与 `SchemaEntity`。
+
+**一个容易漏掉的跨模块契约（实施中发现）：`dropSchema` 必须支持 `cascade = true`。** `CatalogManager.dropCatalog(force = true)` 对 **managed catalog** 会逐个 `dropSchema(schema.nameIdentifier(), true)`（`CatalogManager.java:880-892`，注释明说"managed catalog 需要调 drop schema API 才能连带资源一起删"），失败即整个 dropCatalog 失败。federated 的 Iceberg 入口反而明确拒绝 cascade（`IcebergCatalogOperations.dropSchema` 里 `Preconditions.checkArgument(!cascade, ...)`），所以**不能简单照抄 federated**：managed 下 cascade 先逐个 drop schema 内的表（非 purge，保留数据文件），再删 namespace。
 
 视图（`iceberg_type = 'VIEW'`）有意推迟。
 

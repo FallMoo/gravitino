@@ -25,6 +25,8 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -39,19 +41,26 @@ import org.apache.gravitino.EntityStore;
 import org.apache.gravitino.GravitinoEnv;
 import org.apache.gravitino.NameIdentifier;
 import org.apache.gravitino.Namespace;
+import org.apache.gravitino.Schema;
+import org.apache.gravitino.SchemaChange;
 import org.apache.gravitino.StringIdentifier;
 import org.apache.gravitino.catalog.ManagedTableOperations;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergColumn;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergConstants;
+import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergSchema;
+import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergSchemaPropertiesMetadata;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergTable;
 import org.apache.gravitino.catalog.lakehouse.iceberg.ops.IcebergCatalogWrapperHelper;
 import org.apache.gravitino.connector.CatalogInfo;
 import org.apache.gravitino.connector.CatalogOperations;
 import org.apache.gravitino.connector.HasPropertyMetadata;
 import org.apache.gravitino.connector.SupportsSchemas;
+import org.apache.gravitino.exceptions.NoSuchCatalogException;
 import org.apache.gravitino.exceptions.NoSuchEntityException;
 import org.apache.gravitino.exceptions.NoSuchSchemaException;
 import org.apache.gravitino.exceptions.NoSuchTableException;
+import org.apache.gravitino.exceptions.NonEmptySchemaException;
+import org.apache.gravitino.exceptions.SchemaAlreadyExistsException;
 import org.apache.gravitino.exceptions.TableAlreadyExistsException;
 import org.apache.gravitino.iceberg.common.IcebergConfig;
 import org.apache.gravitino.iceberg.common.ops.ManagedIcebergCatalogOps;
@@ -111,7 +120,7 @@ import org.slf4j.LoggerFactory;
  * store connection inside one transaction. The Iceberg SDK never opens a database connection.
  */
 public class IcebergManagedCatalogOperations extends ManagedTableOperations
-    implements CatalogOperations, ManagedIcebergCatalogOps {
+    implements CatalogOperations, ManagedIcebergCatalogOps, SupportsSchemas {
 
   private static final Logger LOG = LoggerFactory.getLogger(IcebergManagedCatalogOperations.class);
 
@@ -330,6 +339,132 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
   }
 
   // ---------------------------------------------------------------------------------------------
+  // Gravitino native schema entry (design phase 5): SupportsSchemas over the same namespace
+  // primitives, so both entries write the property rows and the entity in one transaction.
+  // ---------------------------------------------------------------------------------------------
+
+  @Override
+  public Schema createSchema(NameIdentifier ident, String comment, Map<String, String> properties)
+      throws NoSuchSchemaException, SchemaAlreadyExistsException {
+    Map<String, String> schemaProperties =
+        new LinkedHashMap<>(properties == null ? Collections.emptyMap() : properties);
+    if (comment != null) {
+      // The federated Iceberg entry keeps the schema comment as a namespace property as well.
+      schemaProperties.put(IcebergSchemaPropertiesMetadata.COMMENT, comment);
+    }
+    try {
+      createNamespaceInternal(toIcebergNamespace(ident.name()), schemaProperties, comment);
+    } catch (AlreadyExistsException e) {
+      throw new SchemaAlreadyExistsException(e, "Schema %s already exists", ident);
+    }
+    return loadSchema(ident);
+  }
+
+  @Override
+  public Schema loadSchema(NameIdentifier ident) throws NoSuchSchemaException {
+    Map<String, String> properties;
+    try {
+      properties = loadNamespace(toIcebergNamespace(ident.name())).properties();
+    } catch (NoSuchNamespaceException e) {
+      throw new NoSuchSchemaException(e, "Schema %s does not exist", ident);
+    }
+    return IcebergSchema.builder()
+        .withName(ident.name())
+        .withComment(properties.get(IcebergSchemaPropertiesMetadata.COMMENT))
+        .withProperties(properties)
+        .build();
+  }
+
+  @Override
+  public Schema alterSchema(NameIdentifier ident, SchemaChange... changes)
+      throws NoSuchSchemaException {
+    Map<String, String> updates = new LinkedHashMap<>();
+    List<String> removals = new ArrayList<>();
+    for (SchemaChange change : changes) {
+      if (change instanceof SchemaChange.SetProperty) {
+        SchemaChange.SetProperty setProperty = (SchemaChange.SetProperty) change;
+        updates.put(setProperty.getProperty(), setProperty.getValue());
+      } else if (change instanceof SchemaChange.RemoveProperty) {
+        removals.add(((SchemaChange.RemoveProperty) change).getProperty());
+      } else {
+        throw new IllegalArgumentException(
+            "Unsupported schema change type: " + change.getClass().getSimpleName());
+      }
+    }
+
+    try {
+      updateNamespaceProperties(
+          toIcebergNamespace(ident.name()),
+          UpdateNamespacePropertiesRequest.builder()
+              .updateAll(new HashMap<>(updates))
+              .removeAll(removals)
+              .build());
+    } catch (NoSuchNamespaceException e) {
+      throw new NoSuchSchemaException(e, "Schema %s does not exist", ident);
+    }
+    return loadSchema(ident);
+  }
+
+  @Override
+  public boolean dropSchema(NameIdentifier ident, boolean cascade) throws NonEmptySchemaException {
+    org.apache.iceberg.catalog.Namespace namespace = toIcebergNamespace(ident.name());
+    if (!namespaceExists(namespace)) {
+      return false;
+    }
+
+    if (cascade) {
+      // Managed mode owns the tables, so a cascading drop removes them before the namespace. The
+      // tables are dropped without purging, matching dropTable's default: the metadata pointers go
+      // away, the data files stay.
+      // listTables takes the schema namespace (metalake.catalog.<schema>), not the schema's parent.
+      String[] schemaLevels =
+          Arrays.copyOf(ident.namespace().levels(), ident.namespace().length() + 1);
+      schemaLevels[schemaLevels.length - 1] = ident.name();
+      for (NameIdentifier tableIdent : listTables(Namespace.of(schemaLevels))) {
+        dropTable(tableIdent);
+      }
+    }
+
+    try {
+      dropNamespace(namespace);
+      return true;
+    } catch (NamespaceNotEmptyException e) {
+      throw new NonEmptySchemaException(
+          e, "Schema %s is not empty. One or more tables exist.", ident.name());
+    }
+  }
+
+  @Override
+  public boolean schemaExists(NameIdentifier ident) {
+    return namespaceExists(toIcebergNamespace(ident.name()));
+  }
+
+  @Override
+  public NameIdentifier[] listSchemas(Namespace namespace) throws NoSuchCatalogException {
+    String separator = HierarchicalSchemaUtil.schemaSeparator();
+    org.apache.iceberg.catalog.Namespace parent =
+        namespace.length() == 2
+            ? org.apache.iceberg.catalog.Namespace.empty()
+            : toIcebergNamespace(
+                String.join(
+                    separator, Arrays.copyOfRange(namespace.levels(), 2, namespace.length())));
+    Namespace catalogNamespace = Namespace.of(namespace.level(0), namespace.level(1));
+    return listNamespaces(parent).namespaces().stream()
+        .map(
+            icebergNamespace ->
+                NameIdentifier.of(
+                    catalogNamespace,
+                    IcebergIdentifierUtils.icebergNamespaceToSchemaName(
+                        icebergNamespace, separator)))
+        .toArray(NameIdentifier[]::new);
+  }
+
+  private static org.apache.iceberg.catalog.Namespace toIcebergNamespace(String schemaName) {
+    return IcebergIdentifierUtils.getIcebergNamespaceFromSchemaName(
+        schemaName, HierarchicalSchemaUtil.schemaSeparator());
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // Namespace operations (design doc section 5.11)
   // ---------------------------------------------------------------------------------------------
 
@@ -338,7 +473,13 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
 
   @Override
   public CreateNamespaceResponse createNamespace(CreateNamespaceRequest request) {
-    org.apache.iceberg.catalog.Namespace namespace = request.namespace();
+    return createNamespaceInternal(request.namespace(), request.properties(), null);
+  }
+
+  private CreateNamespaceResponse createNamespaceInternal(
+      org.apache.iceberg.catalog.Namespace namespace,
+      Map<String, String> requestProperties,
+      String comment) {
     String tableNamespace = namespaceToTableNamespace(namespace);
     NameIdentifier schemaIdent = toSchemaIdentifier(namespace);
 
@@ -346,7 +487,7 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
       throw new AlreadyExistsException("Namespace %s already exists", tableNamespace);
     }
 
-    Map<String, String> properties = new LinkedHashMap<>(request.properties());
+    Map<String, String> properties = new LinkedHashMap<>(requestProperties);
     // Iceberg's JDBC backend always stores a location, and namespace existence is derived from the
     // property rows, so a request without properties still needs one row.
     properties.putIfAbsent(NAMESPACE_LOCATION_PROPERTY, defaultNamespaceLocation(namespace));
@@ -359,7 +500,7 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
           }
           // The Gravitino schema entity is written in the same transaction, because
           // managedStorage(SCHEMA) is declared SUPPORTED.
-          putSchemaEntity(schemaIdent, properties);
+          putSchemaEntity(schemaIdent, properties, comment);
           return null;
         });
 
@@ -491,13 +632,14 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
     return new ArrayList<>(children);
   }
 
-  private void putSchemaEntity(NameIdentifier schemaIdent, Map<String, String> properties) {
+  private void putSchemaEntity(
+      NameIdentifier schemaIdent, Map<String, String> properties, String comment) {
     SchemaEntity entity =
         SchemaEntity.builder()
             .withId(idGenerator().nextId())
             .withName(schemaIdent.name())
             .withNamespace(schemaIdent.namespace())
-            .withComment(null)
+            .withComment(comment)
             .withProperties(properties)
             .withAuditInfo(currentAuditInfo())
             .build();
@@ -533,7 +675,7 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
     } catch (NoSuchEntityException e) {
       // The namespace exists in iceberg_namespace_properties but has no Gravitino schema entity yet
       // (for example it was created implicitly by a table): create it now.
-      putSchemaEntity(schemaIdent, properties);
+      putSchemaEntity(schemaIdent, properties, null);
     } catch (IOException e) {
       throw new RuntimeException("Failed to update the Gravitino schema entity " + schemaIdent, e);
     }
