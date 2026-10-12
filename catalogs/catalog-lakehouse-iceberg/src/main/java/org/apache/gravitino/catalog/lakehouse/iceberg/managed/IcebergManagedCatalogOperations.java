@@ -138,6 +138,10 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
   public void initialize(
       Map<String, String> conf, CatalogInfo info, HasPropertyMetadata propertiesMetadata)
       throws RuntimeException {
+    // Idempotent: the catalog-level check usually created them already. This covers the path where
+    // the operations are initialized without that check having run in this JVM.
+    ManagedIcebergMetadataStore.ensureIcebergTables();
+
     // Re-run the fail-fast preconditions: the catalog-level check happens while the wrapper is
     // built, this one guarantees the operations themselves never start in a broken environment.
     IcebergManagedCatalogPrerequisites.validate(conf);

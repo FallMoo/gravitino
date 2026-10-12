@@ -24,6 +24,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.gravitino.annotation.Evolving;
 import org.apache.gravitino.catalog.lakehouse.iceberg.managed.IcebergManagedCatalogOperations;
 import org.apache.gravitino.catalog.lakehouse.iceberg.managed.IcebergManagedCatalogPrerequisites;
+import org.apache.gravitino.catalog.lakehouse.iceberg.managed.ManagedIcebergMetadataStore;
 import org.apache.gravitino.connector.BaseCatalog;
 import org.apache.gravitino.connector.CatalogOperations;
 import org.apache.gravitino.connector.PropertiesMetadata;
@@ -101,6 +102,14 @@ public class IcebergCatalog extends BaseCatalog<IcebergCatalog> {
     if (!prerequisitesChecked) {
       synchronized (this) {
         if (!prerequisitesChecked) {
+          if (backendMode() == IcebergCatalogBackendMode.MANAGED) {
+            // Managed catalogs need the Iceberg pointer tables in the entity store database. Create
+            // them here, outside any transaction, so a fresh deployment works without running the
+            // init script by hand; the script stays for deployments whose database user cannot run
+            // DDL, in which case this only logs and the validation below reports the actionable
+            // error.
+            ManagedIcebergMetadataStore.ensureIcebergTables();
+          }
           IcebergManagedCatalogPrerequisites.validate(properties);
           prerequisitesChecked = true;
         }

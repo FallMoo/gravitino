@@ -1388,4 +1388,37 @@ public class TestIcebergManagedCatalogOperations {
     assertFalse(ops.tableExists(tableIdent));
     assertEquals(0L, countIcebergRows("t_in_native_schema"));
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // Pointer table bootstrap (design doc section 5.7: DDL outside any transaction)
+  // ---------------------------------------------------------------------------------------------
+
+  @Test
+  public void testInitializeCreatesMissingIcebergPointerTables() throws Exception {
+    try (Connection connection = DriverManager.getConnection(entityJdbcUrl, "root", "123");
+        Statement statement = connection.createStatement()) {
+      connection.setAutoCommit(true);
+      statement.execute("DROP TABLE IF EXISTS iceberg_tables");
+      statement.execute("DROP TABLE IF EXISTS iceberg_namespace_properties");
+    }
+
+    // Initializing the operations must recreate the V1 pointer tables, so a fresh deployment does
+    // not have to run the init script by hand.
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    ops.createTable(namespace, restCreateRequest("t_after_ddl", false));
+    assertEquals(1L, countIcebergRows("t_after_ddl"), "the pointer row could not be written");
+
+    // The DDL is idempotent, so a second initialization (another catalog or a reload) is fine.
+    IcebergManagedCatalogOperations again = newOpsForRest();
+    assertEquals(
+        2,
+        again
+            .loadTable(org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_after_ddl"))
+            .tableMetadata()
+            .schema()
+            .columns()
+            .size());
+  }
 }

@@ -30,6 +30,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import org.apache.gravitino.storage.relational.session.SqlSessions;
+import org.apache.gravitino.storage.relational.utils.SessionUtils;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableProperties;
@@ -185,6 +187,34 @@ public class ManagedIcebergMetadataStore {
     try (Statement statement = connection.createStatement()) {
       statement.execute(CREATE_ICEBERG_TABLES_DDL);
       statement.execute(CREATE_ICEBERG_NAMESPACE_PROPERTIES_DDL);
+    }
+  }
+
+  /**
+   * Creates the Iceberg V1 tables on a short-lived entity-store transaction when they are missing.
+   *
+   * <p>They live in the same database as the Gravitino entity store, and this is called while a
+   * catalog is initialized, never inside an existing transaction: MySQL commits DDL implicitly, so
+   * running it on a bound transaction would silently break the "pointer row and entity row commit
+   * together" guarantee (design doc section 5.7). When the database user is not allowed to run DDL
+   * the failure is only logged - the probe in {@code IcebergManagedCatalogPrerequisites.validate}
+   * then reports the actionable error that points at the init script.
+   */
+  public static void ensureIcebergTables() {
+    if (SqlSessions.getBoundConnection() != null) {
+      LOG.debug("A Gravitino transaction is already bound, skipping the Iceberg pointer table DDL");
+      return;
+    }
+    SessionUtils.beginTransaction();
+    try {
+      createIcebergTablesIfNotExists(SessionUtils.currentConnection());
+      SessionUtils.commitTransactionAndConnection();
+    } catch (SQLException | RuntimeException e) {
+      SessionUtils.rollbackTransactionAndConnection();
+      LOG.warn(
+          "Failed to create the Iceberg pointer tables; a managed catalog requires them in the"
+              + " Gravitino entity store database",
+          e);
     }
   }
 
