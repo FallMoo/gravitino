@@ -18,6 +18,7 @@
  */
 package org.apache.gravitino.iceberg.integration.test;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -29,6 +30,11 @@ import org.apache.gravitino.NameIdentifier;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergConstants;
 import org.apache.gravitino.client.GravitinoMetalake;
 import org.apache.gravitino.integration.test.util.BaseIT;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.spark.SparkConf;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -131,6 +137,10 @@ public class IcebergRESTManagedCatalogIT extends BaseIT {
     spark.sql(String.format("INSERT INTO %s VALUES (1, 'a'), (2, 'b')", fullTable(TABLE)));
     Assertions.assertEquals(
         2, spark.sql(String.format("SELECT * FROM %s", fullTable(TABLE))).count());
+    // Metadata tables are served by the same commit path, so this proves the pointer rows hold real
+    // Iceberg metadata rather than only Spark's cached view.
+    Assertions.assertEquals(
+        1, spark.sql(String.format("SELECT * FROM %s.snapshots", fullTable(TABLE))).count());
 
     // Alter: the native Iceberg commit path through the REST entry.
     spark.sql(String.format("ALTER TABLE %s ADD COLUMN extra STRING", fullTable(TABLE)));
@@ -147,10 +157,43 @@ public class IcebergRESTManagedCatalogIT extends BaseIT {
     assertTableEntityExists(TABLE, false);
     assertTableEntityExists(RENAMED_TABLE, true);
 
+    Assertions.assertEquals(
+        2,
+        spark.sql(String.format("SELECT * FROM %s.snapshots", fullTable(RENAMED_TABLE))).count(),
+        "both inserts must have produced a snapshot; the alter is metadata only");
+
     // Drop removes the pointer row and the entity.
     spark.sql(String.format("DROP TABLE %s PURGE", fullTable(RENAMED_TABLE)));
     assertTableEntityExists(RENAMED_TABLE, false);
+
+    // A missing table must surface as an Iceberg NoSuchTableException (404), not as a server error:
+    // Iceberg clients rely on catching it to answer tableExists.
+    Assertions.assertThrows(
+        org.apache.iceberg.exceptions.NoSuchTableException.class,
+        () -> loadTableThroughREST(RENAMED_TABLE));
+
     spark.sql(String.format("DROP DATABASE %s", NAMESPACE));
+  }
+
+  private Table loadTableThroughREST(String table) {
+    Map<String, String> properties =
+        ImmutableMap.of(
+            CatalogProperties.URI,
+            getIcebergRestServiceUri(),
+            CatalogProperties.CACHE_ENABLED,
+            "false");
+    RESTCatalog restCatalog = new RESTCatalog();
+    restCatalog.setConf(new Configuration());
+    restCatalog.initialize(SPARK_CATALOG, properties);
+    try {
+      return restCatalog.loadTable(TableIdentifier.of(NAMESPACE, table));
+    } finally {
+      try {
+        restCatalog.close();
+      } catch (IOException e) {
+        LOG.warn("Failed to close the Iceberg REST catalog", e);
+      }
+    }
   }
 
   private void initSparkEnv() {
