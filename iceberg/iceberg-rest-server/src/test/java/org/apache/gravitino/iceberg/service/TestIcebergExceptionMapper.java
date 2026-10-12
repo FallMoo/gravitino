@@ -33,6 +33,7 @@ import org.apache.iceberg.exceptions.NotAuthorizedException;
 import org.apache.iceberg.exceptions.ServiceUnavailableException;
 import org.apache.iceberg.exceptions.UnprocessableEntityException;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.rest.responses.ErrorResponse;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -64,5 +65,43 @@ public class TestIcebergExceptionMapper {
     checkExceptionStatus(new CommitStateUnknownException("", new RuntimeException()), 500);
     checkExceptionStatus(new ServiceUnavailableException(""), 503);
     checkExceptionStatus(new RuntimeException(), 500);
+
+    // A managed catalog surfaces Gravitino exceptions; clients must still see the Iceberg status.
+    checkExceptionStatus(new org.apache.gravitino.exceptions.NoSuchTableException(""), 404);
+    checkExceptionStatus(new org.apache.gravitino.exceptions.NoSuchSchemaException(""), 404);
+    checkExceptionStatus(new org.apache.gravitino.exceptions.NoSuchCatalogException(""), 404);
+    checkExceptionStatus(new org.apache.gravitino.exceptions.TableAlreadyExistsException(""), 409);
+    checkExceptionStatus(new org.apache.gravitino.exceptions.SchemaAlreadyExistsException(""), 409);
+    checkExceptionStatus(new org.apache.gravitino.exceptions.AlreadyExistsException(""), 409);
+    checkExceptionStatus(new org.apache.gravitino.exceptions.NonEmptySchemaException(""), 409);
+  }
+
+  @Test
+  public void testGravitinoExceptionsBecomeIcebergExceptions() {
+    // The error type in the response is the exception's simple name, so the conversion is what
+    // makes
+    // the Iceberg REST client throw the exception its callers catch.
+    Assertions.assertInstanceOf(
+        NoSuchTableException.class,
+        IcebergExceptionMapper.convertToIcebergException(
+            new org.apache.gravitino.exceptions.NoSuchTableException("t does not exist")));
+    Assertions.assertInstanceOf(
+        NoSuchNamespaceException.class,
+        IcebergExceptionMapper.convertToIcebergException(
+            new org.apache.gravitino.exceptions.NoSuchSchemaException("db does not exist")));
+    Assertions.assertInstanceOf(
+        AlreadyExistsException.class,
+        IcebergExceptionMapper.convertToIcebergException(
+            new org.apache.gravitino.exceptions.TableAlreadyExistsException("t exists")));
+    Assertions.assertInstanceOf(
+        NamespaceNotEmptyException.class,
+        IcebergExceptionMapper.convertToIcebergException(
+            new org.apache.gravitino.exceptions.NonEmptySchemaException("db is not empty")));
+    Response response =
+        new IcebergExceptionMapper()
+            .toResponse(new org.apache.gravitino.exceptions.NoSuchTableException("t"));
+    Assertions.assertEquals(404, response.getStatus());
+    ErrorResponse errorResponse = (ErrorResponse) response.getEntity();
+    Assertions.assertEquals(NoSuchTableException.class.getSimpleName(), errorResponse.type());
   }
 }

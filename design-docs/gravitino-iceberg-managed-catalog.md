@@ -928,6 +928,14 @@ managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamesp
 * 附带：managed wrapper 支持 credential vending（§5.9 分层表说明），复用基类的凭证构造逻辑，`/credentials` 端点从实现层读取 metadata。
 * 附带：`IcebergManagedCatalogOperations` 实现 `connector.SupportsSchemas`。capability 既然声明了 `managedStorage(SCHEMA) = SUPPORTED`，native schema API（create/load/alter/list/exists/drop）就必须由实现层提供，否则 `CatalogWrapper.asSchemas()` 返回 null，native schema 路径直接抛"不支持 schema 操作"。实现直接复用 §5.11 的 namespace 原语：schema comment 与属性落到 `iceberg_namespace_properties` 与 `SchemaEntity`。
 
+**端到端验证（实施中新增）：`IcebergRESTManagedCatalogIT`。** 这是唯一一条真正穿过"客户端→REST→实现层→实体库"的用例：Spark 用 Iceberg 原生 REST 客户端（`type=rest`）连到 Gravitino 的 aux Iceberg REST 服务，服务侧用 `MiniGravitino`（完整 `GravitinoServer` + 同进程 `GravitinoEnv`，满足 auxiliary 前置），实体存储用 H2、warehouse 用本地目录，**不需要 Docker**。用例覆盖建库/建表 → 插入 → 查询（带过滤）→ `ADD COLUMN` → 再插入 → 改名 → `DROP ... PURGE` → 删库，并在每一步用 Gravitino 客户端断言实体（`tableExists`）与指针行同生共死。
+
+注意这里**不能**复用 `IcebergRESTServerManagerForEmbedded`：它走 `GravitinoIcebergRESTServer.main` → `GravitinoEnv.initializeBaseComponents`，只有 base 组件、没有 `catalogManager`，managed 的前置校验会直接拒绝。
+
+**e2e 发现并修复的缺陷：实现层抛的 Gravitino 异常在 REST 上被当成 500。** Spark 的 `CREATE TABLE` 会先做 `tableExists`，Iceberg 客户端靠捕获 `NoSuchTableException` 把它当作"不存在"；而 managed 实现层抛的是 `org.apache.gravitino.exceptions.NoSuchTableException`，它既不在 `IcebergExceptionMapper.EXCEPTION_ERROR_CODES` 里，也不会被 `convertToIcebergException` 识别，于是响应变成 500 + 类型 `NoSuchTableException`（Gravitino 的），客户端只能抛 `ServiceFailureException` → 建表直接失败。federated 之所以没暴露，是因为它由 Iceberg SDK 抛 Iceberg 异常。修复分两处：`convertToIcebergException` 补齐 Gravitino 表/库异常的映射（`NoSuchTableException`/`NoSuchSchemaException`→404，`TableAlreadyExistsException`/`SchemaAlreadyExistsException`→409，`NonEmptySchemaException`→`NamespaceNotEmptyException`），`toRESTResponse` 对"有明确非 500 Iceberg 对应物"的异常改用转换后的异常（响应体里的 `error.type` 是异常简单名，客户端据此还原异常）。未映射的内部错误仍保持原类型与 500，避免把通用失败重新贴标签。
+
+**指针表在 catalog 初始化时自动创建。** `ManagedIcebergMetadataStore.ensureIcebergTables()` 在 catalog 侧前置校验之前跑一次 V1 DDL（短事务、且检测到已绑定事务时跳过，因为 MySQL 的 DDL 会隐式提交）；数据库用户无 DDL 权限时只记日志，随后由探测给出指向初始化脚本的可执行错误。
+
 **一个容易漏掉的跨模块契约（实施中发现）：`dropSchema` 必须支持 `cascade = true`。** `CatalogManager.dropCatalog(force = true)` 对 **managed catalog** 会逐个 `dropSchema(schema.nameIdentifier(), true)`（`CatalogManager.java:880-892`，注释明说"managed catalog 需要调 drop schema API 才能连带资源一起删"），失败即整个 dropCatalog 失败。federated 的 Iceberg 入口反而明确拒绝 cascade（`IcebergCatalogOperations.dropSchema` 里 `Preconditions.checkArgument(!cascade, ...)`），所以**不能简单照抄 federated**：managed 下 cascade 先逐个 drop schema 内的表（非 purge，保留数据文件），再删 namespace。
 
 视图（`iceberg_type = 'VIEW'`）有意推迟。

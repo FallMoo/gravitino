@@ -203,6 +203,9 @@ tasks.test {
     exclude("**/integration/test/**")
   } else {
     dependsOn(tasks.jar)
+    // Integration tests that run a managed Iceberg catalog load the catalog implementation through
+    // an isolated class loader from the catalog module's build/libs, so that jar has to be fresh.
+    dependsOn(":catalogs:catalog-lakehouse-iceberg:jar")
   }
 }
 

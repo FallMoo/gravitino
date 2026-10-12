@@ -57,6 +57,7 @@ public class IcebergExceptionMapper implements ExceptionMapper<Exception> {
   private static final Map<Class<? extends Exception>, Integer> EXCEPTION_ERROR_CODES =
       ImmutableMap.<Class<? extends Exception>, Integer>builder()
           .put(IllegalArgumentException.class, 400)
+          .put(BadRequestException.class, 400)
           .put(ValidationException.class, 400)
           .put(IllegalNameIdentifierException.class, 400)
           .put(NamespaceNotEmptyException.class, 409)
@@ -114,6 +115,28 @@ public class IcebergExceptionMapper implements ExceptionMapper<Exception> {
         || e instanceof ValidationException) {
       return new BadRequestException("%s", message);
     }
+    // A managed catalog is served by Gravitino's own implementation layer, which throws Gravitino
+    // exceptions (the federated path gets Iceberg exceptions from the SDK). They have to become
+    // Iceberg exceptions, otherwise the REST response carries a 500 with an unknown error type and
+    // clients cannot tell "not found" from "server broken" - Iceberg's own
+    // Catalog.tableExists relies on catching NoSuchTableException during CREATE TABLE.
+    if (e instanceof org.apache.gravitino.exceptions.NoSuchTableException) {
+      return new NoSuchTableException("%s", message);
+    }
+    if (e instanceof org.apache.gravitino.exceptions.NoSuchSchemaException) {
+      return new NoSuchNamespaceException("%s", message);
+    }
+    if (e instanceof org.apache.gravitino.exceptions.NoSuchCatalogException) {
+      return new NoSuchNamespaceException("%s", message);
+    }
+    if (e instanceof org.apache.gravitino.exceptions.TableAlreadyExistsException
+        || e instanceof org.apache.gravitino.exceptions.SchemaAlreadyExistsException
+        || e instanceof org.apache.gravitino.exceptions.AlreadyExistsException) {
+      return new AlreadyExistsException("%s", message);
+    }
+    if (e instanceof org.apache.gravitino.exceptions.NonEmptySchemaException) {
+      return new NamespaceNotEmptyException("%s", message);
+    }
     if (EXCEPTION_ERROR_CODES.containsKey(e.getClass())) {
       return e;
     }
@@ -126,18 +149,32 @@ public class IcebergExceptionMapper implements ExceptionMapper<Exception> {
   }
 
   public static Response toRESTResponse(Throwable ex) {
+    // The response body carries the exception's simple name as the Iceberg error type, so clients
+    // map that type back to an Iceberg exception. Swap in the converted exception only when it has
+    // a
+    // specific Iceberg status; internal errors keep their original type, because the 500 fallback
+    // would otherwise relabel every unmapped failure.
+    Throwable icebergException = ex;
+    if (ex instanceof Exception) {
+      Exception converted = convertToIcebergException((Exception) ex);
+      Integer convertedStatus = EXCEPTION_ERROR_CODES.get(converted.getClass());
+      if (convertedStatus != null
+          && convertedStatus != Status.INTERNAL_SERVER_ERROR.getStatusCode()) {
+        icebergException = converted;
+      }
+    }
     int status =
         EXCEPTION_ERROR_CODES.getOrDefault(
-            ex.getClass(), Status.INTERNAL_SERVER_ERROR.getStatusCode());
+            icebergException.getClass(), Status.INTERNAL_SERVER_ERROR.getStatusCode());
     if (status == Status.INTERNAL_SERVER_ERROR.getStatusCode()) {
-      LOG.warn("Iceberg REST server unexpected exception:", ex);
+      LOG.warn("Iceberg REST server unexpected exception:", icebergException);
     } else {
       LOG.info(
           "Iceberg REST server error maybe caused by user request, response http status: {}, exception: {}, exception message: {}",
           status,
-          ex.getClass(),
-          ex.getMessage());
+          icebergException.getClass(),
+          icebergException.getMessage());
     }
-    return IcebergRESTUtils.errorResponse(ex, status);
+    return IcebergRESTUtils.errorResponse(icebergException, status);
   }
 }
