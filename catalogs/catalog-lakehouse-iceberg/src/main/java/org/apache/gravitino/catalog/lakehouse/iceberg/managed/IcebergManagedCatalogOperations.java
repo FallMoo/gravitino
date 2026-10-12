@@ -24,7 +24,6 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -32,6 +31,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.gravitino.Entity;
 import org.apache.gravitino.EntityStore;
@@ -72,15 +73,19 @@ import org.apache.gravitino.storage.IdGenerator;
 import org.apache.gravitino.storage.relational.utils.SessionUtils;
 import org.apache.gravitino.utils.HierarchicalSchemaUtil;
 import org.apache.gravitino.utils.PrincipalUtils;
+import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.LocationProviders;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
+import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.ResolvingFileIO;
 import org.apache.iceberg.rest.requests.CreateNamespaceRequest;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
@@ -714,12 +719,105 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
   @Override
   public Table alterTable(NameIdentifier ident, TableChange... changes)
       throws NoSuchTableException, IllegalArgumentException {
-    // The shared primitive is `commit` below; translating Gravitino's TableChange[] onto it is the
-    // Gravitino-native entry work (design doc sections 5.8.2 and 5.9.2), which is deliberately left
-    // to the native-entry phase.
-    throw new UnsupportedOperationException(
-        "Altering a managed Iceberg table through the Gravitino native API is not implemented yet;"
-            + " use the Iceberg REST endpoint.");
+    Optional<TableChange> renameChange =
+        Arrays.stream(changes)
+            .filter(change -> change instanceof TableChange.RenameTable)
+            .reduce((first, second) -> second);
+    if (renameChange.isPresent()) {
+      // The same contract as the federated entry: a rename cannot be combined with other changes.
+      String otherChanges =
+          Arrays.stream(changes)
+              .filter(change -> !(change instanceof TableChange.RenameTable))
+              .map(String::valueOf)
+              .collect(Collectors.joining("\n"));
+      Preconditions.checkArgument(
+          StringUtils.isEmpty(otherChanges),
+          String.format(
+              "The operation to change the table name cannot be performed together with other"
+                  + " operations. The list of operations that you cannot perform includes: \n %s",
+              otherChanges));
+      return renameTable(ident, (TableChange.RenameTable) renameChange.get());
+    }
+
+    TableMetadata base = readMetadata(ident);
+    CapturingTableOperations carrier = new CapturingTableOperations(base, fileIO);
+    // The changes are applied to a BaseTable built on a read-only carrier: the update objects
+    // "commit" into the carrier instead of persisting anything, which reuses Gravitino's existing
+    // TableChange -> Iceberg translation without an Iceberg catalog (design doc section 5.8.2).
+    IcebergCatalogWrapperHelper.applyTableChanges(new BaseTable(carrier, ident.name()), changes);
+    TableMetadata updated = carrier.current();
+    if (updated == base) {
+      // Nothing to persist, so the pointer and the entity stay untouched.
+      return IcebergTable.fromIcebergTable(base, ident.name());
+    }
+    // The shared commit primitive owns the metadata file, the CAS on the pointer row and the
+    // table_meta synchronization.
+    return IcebergTable.fromIcebergTable(commit(ident, base, updated), ident.name());
+  }
+
+  /** A rename expressed as a table change, mirroring the federated entry's translation. */
+  private Table renameTable(NameIdentifier ident, TableChange.RenameTable rename)
+      throws NoSuchTableException {
+    Namespace destNamespace = ident.namespace();
+    if (rename.getNewSchemaName().isPresent()) {
+      String[] destLevels = Arrays.copyOf(destNamespace.levels(), destNamespace.length());
+      destLevels[destLevels.length - 1] = rename.getNewSchemaName().get();
+      destNamespace = Namespace.of(destLevels);
+    }
+    String[] destLevels = Arrays.copyOf(destNamespace.levels(), destNamespace.length() + 1);
+    destLevels[destNamespace.length()] = rename.getNewName();
+    NameIdentifier destination = NameIdentifier.of(destLevels);
+    renameTable(ident, destination);
+    return loadTable(destination);
+  }
+
+  /**
+   * A {@link TableOperations} that records the metadata the Iceberg update objects "commit" instead
+   * of persisting it.
+   *
+   * <p>Managed mode drives the Iceberg update APIs purely for their semantics: the result is read
+   * back from here and written by {@link #commit(NameIdentifier, TableMetadata, TableMetadata)}.
+   * Nothing in this class opens a database connection; the FileIO is the one the metadata files are
+   * written with.
+   */
+  private static final class CapturingTableOperations implements TableOperations {
+    private final FileIO fileIO;
+    private TableMetadata current;
+
+    private CapturingTableOperations(TableMetadata current, FileIO fileIO) {
+      this.current = current;
+      this.fileIO = fileIO;
+    }
+
+    @Override
+    public TableMetadata current() {
+      return current;
+    }
+
+    @Override
+    public TableMetadata refresh() {
+      return current;
+    }
+
+    @Override
+    public void commit(TableMetadata base, TableMetadata metadata) {
+      this.current = metadata;
+    }
+
+    @Override
+    public FileIO io() {
+      return fileIO;
+    }
+
+    @Override
+    public String metadataFileLocation(String fileName) {
+      return ManagedIcebergMetadataStore.metadataFileLocation(current, fileName);
+    }
+
+    @Override
+    public LocationProvider locationProvider() {
+      return LocationProviders.locationsFor(current.location(), current.properties());
+    }
   }
 
   @Override

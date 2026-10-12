@@ -348,7 +348,7 @@ managed 模式在 **catalog 创建时**校验 `auxMode`，不满足直接失败�
 | 写路径原语（create / alter / drop / rename / register） | **完全共享** |
 | 事务边界、乐观并发、失败方向、`table_meta` 同步规则 | **完全共享** |
 | 请求协议（`TableChange[]` vs `MetadataUpdate[]`） | 不共享，各自翻译 |
-| 入口特有能力（credential vending、scan planning、分页、`stageCreate`） | 不共享 |
+| 入口特有能力（credential vending、scan planning、分页、`stageCreate`） | 不共享；注意 **credential vending 在 managed 模式下是支持的**：它只依赖表 metadata 与 catalog 的凭证配置，与"谁拥有元数据"无关 |
 | 请求上下文（`IcebergRequestContext` vs `PrincipalUtils`） | 不共享 |
 
 目标不是"入口不同、实现相同"，而是"**入口只做协议翻译和入口特有的事，所有涉及元数据读写的逻辑只有一份**"。
@@ -669,6 +669,17 @@ Gravitino native 入口传入的是 `TableChange[]`。映射逻辑是 Gravitino 
 
 Iceberg REST 入口传入的是 `UpdateTableRequest`（requirements + updates），走 §5.9.1 的翻译，落到同一个原语。两者的差异见 §5.9.3。
 
+**实施补充（阶段 5）。** Gravitino → Iceberg 的 `TableChange[]` 翻译**复用**现有的 `IcebergCatalogWrapperHelper`，不重写：新增 `applyTableChanges(Table, TableChange...)` 把同一套列 / 属性翻译应用到调用方给的 `Table` 上（该类的 `doXxx` / `alterTableColumn` / `alterTableProperty` 只用到静态状态，已改为 `static`；唯一的实例字段 `icebergCatalog` 只服务于 federated 的 `buildIcebergTableChanges`，行为不变）。
+
+managed 侧把变更应用到构建在**记录式载体**之上的 `BaseTable`：
+* 载体 `CapturingTableOperations` 是 `TableOperations` 的最小实现，`current()`/`refresh()` 返回当前 metadata，`commit(base, metadata)` **只记录**新 metadata、不落盘、不连库，`io()` 返回 managed 的 `FileIO`；
+* Iceberg 的 update 对象（`UpdateSchema` / `UpdateProperties`）照常 `commit()`，只是落进载体；
+* 载体读回的新 metadata 再交给共享的 `commit` 原语，因此 native 入口与 REST 入口共享同一份文件写入、两层 CAS 与 `table_meta` 同步规则。
+
+`TableChange.RenameTable` 按 federated 的翻译处理：解析目标 namespace（可被 `newSchemaName` 覆盖）→ `renameTable` → 按新标识重新加载；且与 federated 一致地禁止与其它变更混用。
+
+**已知边界：Iceberg 只支持 required → optional。** `optional -> required`（`UpdateColumnNullability(false)`）会被 Iceberg 的 `SchemaUpdate` 拒绝；这与入口无关（两个入口走同一份翻译），属于既有行为而非 managed 模式引入的差异。
+
 #### 5.8.3 dropTable / purgeTable
 
 ```
@@ -912,8 +923,9 @@ managed 模式直接针对 `iceberg_namespace_properties` 实现 `SupportsNamesp
 
 **第五阶段 —— Gravitino native 入口（次优先）**
 
-* `TableOperationDispatcher` → 实现层的翻译：把 `TableChange` 映射改写为 `PendingUpdate.apply()` + `TableMetadata.updateXxx()`（§5.8.2）。
+* `TableOperationDispatcher` → 实现层的翻译：把 `TableChange` 映射改写为 `PendingUpdate.apply()` + `TableMetadata.updateXxx()`（§5.8.2）。实现上复用 `IcebergCatalogWrapperHelper.applyTableChanges` + 记录式载体（见 §5.8.2 的实施补充）。
 * 集成测试 8、12、17。
+* 附带：managed wrapper 支持 credential vending（§5.9 分层表说明），复用基类的凭证构造逻辑，`/credentials` 端点从实现层读取 metadata。
 
 视图（`iceberg_type = 'VIEW'`）有意推迟。
 

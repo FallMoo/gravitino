@@ -74,7 +74,7 @@ public class IcebergCatalogWrapperHelper {
     this.icebergCatalog = icebergCatalog;
   }
 
-  private void doDeleteColumn(
+  private static void doDeleteColumn(
       UpdateSchema icebergUpdateSchema, DeleteColumn deleteColumn, Schema icebergTableSchema) {
     NestedField deleteField = icebergTableSchema.findField(DOT.join(deleteColumn.fieldName()));
     if (deleteField == null) {
@@ -88,13 +88,13 @@ public class IcebergCatalogWrapperHelper {
     icebergUpdateSchema.deleteColumn(DOT.join(deleteColumn.fieldName()));
   }
 
-  private void doUpdateColumnComment(
+  private static void doUpdateColumnComment(
       UpdateSchema icebergUpdateSchema, UpdateColumnComment updateColumnComment) {
     icebergUpdateSchema.updateColumnDoc(
         DOT.join(updateColumnComment.fieldName()), updateColumnComment.getNewComment());
   }
 
-  private void doUpdateColumnNullability(
+  private static void doUpdateColumnNullability(
       UpdateSchema icebergUpdateSchema,
       TableChange.UpdateColumnNullability updateColumnNullability) {
     if (updateColumnNullability.nullable()) {
@@ -106,20 +106,21 @@ public class IcebergCatalogWrapperHelper {
     }
   }
 
-  private void doSetProperty(UpdateProperties icebergUpdateProperties, SetProperty setProperty) {
+  private static void doSetProperty(
+      UpdateProperties icebergUpdateProperties, SetProperty setProperty) {
     icebergUpdateProperties.set(setProperty.getProperty(), setProperty.getValue());
   }
 
-  private void doRemoveProperty(
+  private static void doRemoveProperty(
       UpdateProperties icebergUpdateProperties, RemoveProperty removeProperty) {
     icebergUpdateProperties.remove(removeProperty.getProperty());
   }
 
-  private void doRenameColumn(UpdateSchema icebergUpdateSchema, RenameColumn renameColumn) {
+  private static void doRenameColumn(UpdateSchema icebergUpdateSchema, RenameColumn renameColumn) {
     icebergUpdateSchema.renameColumn(DOT.join(renameColumn.fieldName()), renameColumn.getNewName());
   }
 
-  private void doMoveColumn(
+  private static void doMoveColumn(
       UpdateSchema icebergUpdateSchema, String[] fieldName, ColumnPosition columnPosition) {
     if (columnPosition instanceof TableChange.After) {
       After after = (After) columnPosition;
@@ -133,13 +134,13 @@ public class IcebergCatalogWrapperHelper {
     }
   }
 
-  private void doUpdateColumnPosition(
+  private static void doUpdateColumnPosition(
       UpdateSchema icebergUpdateSchema, UpdateColumnPosition updateColumnPosition) {
     doMoveColumn(
         icebergUpdateSchema, updateColumnPosition.fieldName(), updateColumnPosition.getPosition());
   }
 
-  private void doUpdateColumnType(
+  private static void doUpdateColumnType(
       UpdateSchema icebergUpdateSchema,
       UpdateColumnType updateColumnType,
       Schema icebergTableSchema) {
@@ -157,7 +158,7 @@ public class IcebergCatalogWrapperHelper {
     icebergUpdateSchema.updateColumn(fieldName, (PrimitiveType) type);
   }
 
-  private void doAddColumn(UpdateSchema icebergUpdateSchema, AddColumn addColumn) {
+  private static void doAddColumn(UpdateSchema icebergUpdateSchema, AddColumn addColumn) {
     if (addColumn.isAutoIncrement()) {
       throw new IllegalArgumentException("Iceberg doesn't support auto increment column");
     }
@@ -183,7 +184,7 @@ public class IcebergCatalogWrapperHelper {
     }
   }
 
-  private void alterTableProperty(
+  private static void alterTableProperty(
       UpdateProperties icebergUpdateProperties, List<TableChange> propertyChanges) {
     for (TableChange change : propertyChanges) {
       if (change instanceof RemoveProperty) {
@@ -200,7 +201,7 @@ public class IcebergCatalogWrapperHelper {
     icebergUpdateProperties.commit();
   }
 
-  private void alterTableColumn(
+  private static void alterTableColumn(
       UpdateSchema icebergUpdateSchema,
       List<ColumnChange> columnChanges,
       Schema icebergTableSchema) {
@@ -236,32 +237,8 @@ public class IcebergCatalogWrapperHelper {
     TableIdentifier icebergTableIdentifier = buildIcebergTableIdentifier(gravitinoNameIdentifier);
 
     List<ColumnChange> gravitinoColumnChanges = Lists.newArrayList();
-    List<TableChange> gravitinoPropertyChanges = Lists.newArrayList();
-    for (TableChange change : tableChanges) {
-      if (change instanceof ColumnChange) {
-        gravitinoColumnChanges.add((ColumnChange) change);
-      } else if (change instanceof UpdateComment) {
-        UpdateComment updateComment = (UpdateComment) change;
-        gravitinoPropertyChanges.add(new SetProperty("comment", updateComment.getNewComment()));
-      } else if (change instanceof RemoveProperty) {
-        RemoveProperty removeProperty = (RemoveProperty) change;
-        Preconditions.checkArgument(
-            !IcebergReservedProperties.contains(removeProperty.getProperty()),
-            removeProperty.getProperty() + " is not allowed to remove properties");
-        gravitinoPropertyChanges.add(removeProperty);
-      } else if (change instanceof SetProperty) {
-        SetProperty setProperty = (SetProperty) change;
-        Preconditions.checkArgument(
-            !IcebergReservedProperties.contains(setProperty.getProperty()),
-            setProperty.getProperty() + " is not allowed to Set properties");
-        gravitinoPropertyChanges.add(setProperty);
-      } else if (change instanceof RenameTable) {
-        throw new RuntimeException("RenameTable shouldn't use tableUpdate interface");
-      } else {
-        throw new UnsupportedOperationException(
-            "Iceberg doesn't support " + change.getClass() + "for now");
-      }
-    }
+    List<TableChange> gravitinoPropertyChanges =
+        classifyTableChanges(tableChanges, gravitinoColumnChanges);
 
     Table icebergBaseTable = icebergCatalog.loadTable(icebergTableIdentifier);
     Transaction transaction = icebergBaseTable.newTransaction();
@@ -277,6 +254,63 @@ public class IcebergCatalogWrapperHelper {
     }
 
     return icebergTableChange;
+  }
+
+  /**
+   * Applies Gravitino table changes to an Iceberg table and leaves the caller in charge of the
+   * commit. Managed mode builds the table on top of a read-only carrier, applies the changes here,
+   * and then persists the result through its own transactional primitive instead of going through
+   * an Iceberg {@code Transaction} (design doc section 5.8.2).
+   *
+   * @param icebergTable the table to apply the changes to
+   * @param tableChanges the Gravitino changes
+   */
+  public static void applyTableChanges(Table icebergTable, TableChange... tableChanges) {
+    List<ColumnChange> columnChanges = Lists.newArrayList();
+    List<TableChange> propertyChanges = classifyTableChanges(tableChanges, columnChanges);
+
+    if (!columnChanges.isEmpty()) {
+      alterTableColumn(icebergTable.updateSchema(), columnChanges, icebergTable.schema());
+    }
+
+    if (!propertyChanges.isEmpty()) {
+      alterTableProperty(icebergTable.updateProperties(), propertyChanges);
+    }
+  }
+
+  /**
+   * Splits the Gravitino changes into column changes (returned through {@code columnChanges}) and
+   * property changes (returned), validating the reserved-property and rename rules on the way.
+   */
+  private static List<TableChange> classifyTableChanges(
+      TableChange[] tableChanges, List<ColumnChange> columnChanges) {
+    List<TableChange> propertyChanges = Lists.newArrayList();
+    for (TableChange change : tableChanges) {
+      if (change instanceof ColumnChange) {
+        columnChanges.add((ColumnChange) change);
+      } else if (change instanceof UpdateComment) {
+        UpdateComment updateComment = (UpdateComment) change;
+        propertyChanges.add(new SetProperty("comment", updateComment.getNewComment()));
+      } else if (change instanceof RemoveProperty) {
+        RemoveProperty removeProperty = (RemoveProperty) change;
+        Preconditions.checkArgument(
+            !IcebergReservedProperties.contains(removeProperty.getProperty()),
+            removeProperty.getProperty() + " is not allowed to remove properties");
+        propertyChanges.add(removeProperty);
+      } else if (change instanceof SetProperty) {
+        SetProperty setProperty = (SetProperty) change;
+        Preconditions.checkArgument(
+            !IcebergReservedProperties.contains(setProperty.getProperty()),
+            setProperty.getProperty() + " is not allowed to Set properties");
+        propertyChanges.add(setProperty);
+      } else if (change instanceof RenameTable) {
+        throw new RuntimeException("RenameTable shouldn't use tableUpdate interface");
+      } else {
+        throw new UnsupportedOperationException(
+            "Iceberg doesn't support " + change.getClass() + "for now");
+      }
+    }
+    return propertyChanges;
   }
 
   /**

@@ -21,6 +21,7 @@ package org.apache.gravitino.catalog.lakehouse.iceberg.managed;
 import static org.apache.gravitino.Configs.CACHE_ENABLED;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -709,21 +710,27 @@ public class TestIcebergManagedCatalogOperations {
   // Iceberg REST entry surface (design doc sections 5.9.1 and 5.10, tests 7 / 9 / 13)
   // ---------------------------------------------------------------------------------------------
 
+  /** The initial schema shared by the managed and the native reference tables. */
+  private static final org.apache.iceberg.Schema REST_SCHEMA =
+      new org.apache.iceberg.Schema(
+          org.apache.iceberg.types.Types.NestedField.required(
+              1, "id", org.apache.iceberg.types.Types.IntegerType.get()),
+          org.apache.iceberg.types.Types.NestedField.optional(
+              2, "name", org.apache.iceberg.types.Types.StringType.get()));
+
+  private static final java.util.Map<String, String> INITIAL_PROPERTIES =
+      java.util.Collections.singletonMap("owner", "spike");
+
   private static org.apache.iceberg.rest.requests.CreateTableRequest restCreateRequest(
       String name, boolean stageCreate) {
     org.apache.iceberg.rest.requests.CreateTableRequest.Builder builder =
         org.apache.iceberg.rest.requests.CreateTableRequest.builder()
             .withName(name)
-            .withSchema(
-                new org.apache.iceberg.Schema(
-                    org.apache.iceberg.types.Types.NestedField.required(
-                        1, "id", org.apache.iceberg.types.Types.IntegerType.get()),
-                    org.apache.iceberg.types.Types.NestedField.optional(
-                        2, "name", org.apache.iceberg.types.Types.StringType.get())))
+            .withSchema(REST_SCHEMA)
             .withPartitionSpec(org.apache.iceberg.PartitionSpec.unpartitioned())
             .withWriteOrder(org.apache.iceberg.SortOrder.unsorted())
             // A mutable map: Iceberg's builder probes it with a null key, which Map.of rejects.
-            .setProperties(new java.util.HashMap<>(Map.of("owner", "spike")));
+            .setProperties(new java.util.HashMap<>(INITIAL_PROPERTIES));
     if (stageCreate) {
       builder.stageCreate();
     }
@@ -1078,5 +1085,229 @@ public class TestIcebergManagedCatalogOperations {
 
     assertTrue(ops.dropTable(ident));
     assertEquals(0L, countIcebergRows("t_drop_atomic"));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Gravitino native entry (design phase 5, tests 8 / 12 / 17)
+  // ---------------------------------------------------------------------------------------------
+
+  private static org.apache.iceberg.catalog.Catalog newNativeIcebergCatalog() {
+    Map<String, String> nativeProperties = new java.util.HashMap<>();
+    nativeProperties.put("uri", entityJdbcUrl);
+    nativeProperties.put("warehouse", warehouseDir.toUri().toString());
+    nativeProperties.put("jdbc.user", "root");
+    nativeProperties.put("jdbc.password", "123");
+    return org.apache.iceberg.CatalogUtil.loadCatalog(
+        "org.apache.iceberg.jdbc.JdbcCatalog", CATALOG, nativeProperties, null);
+  }
+
+  private static TableMetadata metadataOf(org.apache.iceberg.Table table) {
+    return ((org.apache.iceberg.BaseTable) table).operations().current();
+  }
+
+  /** The semantic comparison of design test 8: everything a client can observe about the table. */
+  private static void assertSameTableState(TableMetadata expected, TableMetadata actual) {
+    assertEquals(expected.schema().asStruct(), actual.schema().asStruct(), "schema");
+    assertEquals(expected.spec().fields(), actual.spec().fields(), "partition spec");
+    assertEquals(expected.sortOrder().fields(), actual.sortOrder().fields(), "sort order");
+    assertEquals(expected.properties(), actual.properties(), "properties");
+    assertEquals(expected.lastColumnId(), actual.lastColumnId(), "last column id");
+    assertEquals(expected.formatVersion(), actual.formatVersion(), "format version");
+  }
+
+  private static org.apache.iceberg.Schema schemaWithExtraColumn(
+      TableMetadata base, String columnName) {
+    java.util.List<org.apache.iceberg.types.Types.NestedField> fields =
+        new java.util.ArrayList<>(base.schema().columns());
+    fields.add(
+        org.apache.iceberg.types.Types.NestedField.optional(
+            base.schema().highestFieldId() + 1,
+            columnName,
+            org.apache.iceberg.types.Types.StringType.get()));
+    return new org.apache.iceberg.Schema(fields);
+  }
+
+  @Test
+  public void testNativeAlterMatchesTheIcebergIdiomaticResult() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    NameIdentifier managedIdent = tableIdent("t_native_alter");
+    ops.createTable(namespace, restCreateRequest("t_native_alter", false));
+
+    org.apache.iceberg.catalog.Catalog nativeCatalog = newNativeIcebergCatalog();
+    try {
+      org.apache.iceberg.catalog.TableIdentifier referenceId =
+          org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_native_alter_ref");
+      nativeCatalog.createTable(
+          referenceId,
+          REST_SCHEMA,
+          org.apache.iceberg.PartitionSpec.unpartitioned(),
+          new java.util.HashMap<>(INITIAL_PROPERTIES));
+      org.apache.iceberg.Table reference = nativeCatalog.loadTable(referenceId);
+
+      // 1. add a column and place it after the first one
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.addColumn(
+              new String[] {"extra"},
+              Types.StringType.get(),
+              "added",
+              org.apache.gravitino.rel.TableChange.ColumnPosition.after("id")));
+      reference
+          .updateSchema()
+          .addColumn("extra", org.apache.iceberg.types.Types.StringType.get(), "added")
+          .moveAfter("extra", "id")
+          .commit();
+      assertSameTableState(metadataOf(reference), ops.readMetadata(managedIdent));
+
+      // 2. update the comment, rename, move to the front, make it required
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.updateColumnComment(
+              new String[] {"extra"}, "changed"));
+      reference.updateSchema().updateColumnDoc("extra", "changed").commit();
+      assertSameTableState(metadataOf(reference), ops.readMetadata(managedIdent));
+
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.renameColumn(new String[] {"extra"}, "renamed"));
+      reference.updateSchema().renameColumn("extra", "renamed").commit();
+
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.updateColumnPosition(
+              new String[] {"renamed"},
+              org.apache.gravitino.rel.TableChange.ColumnPosition.first()));
+      reference.updateSchema().moveFirst("renamed").commit();
+
+      // Iceberg only supports required -> optional; the reverse is rejected for both entries.
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.updateColumnNullability(new String[] {"id"}, true));
+      reference.updateSchema().makeColumnOptional("id").commit();
+      assertSameTableState(metadataOf(reference), ops.readMetadata(managedIdent));
+
+      // 3. add, widen and drop a second column (int -> long is a valid promotion)
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.addColumn(
+              new String[] {"count"}, Types.IntegerType.get()));
+      reference
+          .updateSchema()
+          .addColumn("count", org.apache.iceberg.types.Types.IntegerType.get())
+          .commit();
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.updateColumnType(
+              new String[] {"count"}, Types.LongType.get()));
+      reference
+          .updateSchema()
+          .updateColumn("count", org.apache.iceberg.types.Types.LongType.get())
+          .commit();
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.deleteColumn(new String[] {"count"}, true));
+      reference.updateSchema().deleteColumn("count").commit();
+      assertSameTableState(metadataOf(reference), ops.readMetadata(managedIdent));
+
+      // 4. properties and the table comment
+      ops.alterTable(
+          managedIdent,
+          org.apache.gravitino.rel.TableChange.setProperty("write.format.default", "parquet"));
+      reference.updateProperties().set("write.format.default", "parquet").commit();
+      ops.alterTable(managedIdent, org.apache.gravitino.rel.TableChange.updateComment("hello"));
+      reference.updateProperties().set("comment", "hello").commit();
+      ops.alterTable(managedIdent, org.apache.gravitino.rel.TableChange.removeProperty("owner"));
+      reference.updateProperties().remove("owner").commit();
+      assertSameTableState(metadataOf(reference), ops.readMetadata(managedIdent));
+
+      // every alter moved the pointer and stayed readable
+      assertTrue(
+          ops.metadataLocation(
+                  org.apache.iceberg.catalog.TableIdentifier.of(namespace, "t_native_alter"))
+              .isPresent());
+    } finally {
+      ((AutoCloseable) nativeCatalog).close();
+    }
+  }
+
+  @Test
+  public void testConcurrentAltersDoNotLoseUpdates() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    NameIdentifier ident = tableIdent("t_concurrent_alter");
+    ops.createTable(
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA),
+        restCreateRequest("t_concurrent_alter", false));
+
+    TableMetadata base = ops.readMetadata(ident);
+    // Both writers build their change on top of the same base.
+    TableMetadata winner = base.updateSchema(schemaWithExtraColumn(base, "first"));
+    TableMetadata loser = base.updateSchema(schemaWithExtraColumn(base, "second"));
+
+    ops.commit(ident, base, winner);
+    assertThrows(
+        org.apache.iceberg.exceptions.CommitFailedException.class,
+        () -> ops.commit(ident, base, loser));
+
+    TableMetadata current = ops.readMetadata(ident);
+    assertNotNull(current.schema().findField("first"), "the winner's column must survive");
+    assertNull(current.schema().findField("second"), "the loser's column must not appear");
+  }
+
+  @Test
+  public void testRestAndNativeEntriesProduceTheSameResult() throws Exception {
+    IcebergManagedCatalogOperations ops = newOpsForRest();
+    org.apache.iceberg.catalog.Namespace namespace =
+        org.apache.iceberg.catalog.Namespace.of(SCHEMA);
+    NameIdentifier nativeIdent = tableIdent("t_two_entries_native");
+    NameIdentifier restIdent = tableIdent("t_two_entries_rest");
+    ops.createTable(namespace, restCreateRequest("t_two_entries_native", false));
+    ops.createTable(namespace, restCreateRequest("t_two_entries_rest", false));
+
+    // Native entry.
+    ops.alterTable(
+        nativeIdent,
+        org.apache.gravitino.rel.TableChange.addColumn(
+            new String[] {"extra"},
+            Types.StringType.get(),
+            "added",
+            org.apache.gravitino.rel.TableChange.ColumnPosition.after("id")));
+    TableMetadata nativeMetadata = ops.readMetadata(nativeIdent);
+
+    // REST entry: the updates are derived the way an Iceberg REST client derives them, from a
+    // builder that recorded the applied updates (so the schema id is the one Iceberg assigned).
+    TableMetadata restBase = ops.readMetadata(restIdent);
+    TableMetadata.Builder clientBuilder = TableMetadata.buildFrom(restBase);
+    new org.apache.iceberg.MetadataUpdate.AddSchema(nativeMetadata.schema()).applyTo(clientBuilder);
+    new org.apache.iceberg.MetadataUpdate.SetCurrentSchema(nativeMetadata.schema().schemaId())
+        .applyTo(clientBuilder);
+    org.apache.iceberg.rest.requests.UpdateTableRequest request =
+        org.apache.iceberg.rest.requests.UpdateTableRequest.create(
+            org.apache.gravitino.catalog.lakehouse.iceberg.ops.IcebergCatalogWrapperHelper
+                .buildIcebergTableIdentifier(restIdent),
+            java.util.List.of(
+                new org.apache.iceberg.UpdateRequirement.AssertTableUUID(restBase.uuid())),
+            clientBuilder.build().changes());
+    ops.updateTable(
+        org.apache.gravitino.catalog.lakehouse.iceberg.ops.IcebergCatalogWrapperHelper
+            .buildIcebergTableIdentifier(restIdent),
+        request);
+
+    TableMetadata restMetadata = ops.readMetadata(restIdent);
+    assertSameTableState(nativeMetadata, restMetadata);
+    assertEquals(
+        nativeMetadata.schema().columns().size(),
+        restMetadata.schema().columns().size(),
+        "both entries must apply the column change");
+    assertNotEquals(
+        restBase.metadataFileLocation(),
+        restMetadata.metadataFileLocation(),
+        "the REST commit must move the pointer");
+    // Both entries synchronized table_meta in the same transaction as the pointer.
+    assertEquals(
+        3, store.get(nativeIdent, Entity.EntityType.TABLE, TableEntity.class).columns().size());
+    assertEquals(
+        3, store.get(restIdent, Entity.EntityType.TABLE, TableEntity.class).columns().size());
   }
 }
