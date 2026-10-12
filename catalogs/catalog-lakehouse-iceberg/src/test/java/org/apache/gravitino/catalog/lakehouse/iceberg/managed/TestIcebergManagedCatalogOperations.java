@@ -114,9 +114,14 @@ public class TestIcebergManagedCatalogOperations {
 
   private static final class FailingTableEntityStore extends RelationalEntityStore {
     private final AtomicBoolean failTablePuts = new AtomicBoolean(false);
+    private final AtomicBoolean failTableDeletes = new AtomicBoolean(false);
 
     private void failTablePuts(boolean fail) {
       failTablePuts.set(fail);
+    }
+
+    private void failTableDeletes(boolean fail) {
+      failTableDeletes.set(fail);
     }
 
     @Override
@@ -126,6 +131,15 @@ public class TestIcebergManagedCatalogOperations {
         throw new IOException("injected table_meta write failure");
       }
       super.put(e, overwritten);
+    }
+
+    @Override
+    public boolean delete(NameIdentifier ident, Entity.EntityType type, boolean cascade)
+        throws IOException {
+      if (type == Entity.EntityType.TABLE && failTableDeletes.get()) {
+        throw new IOException("injected table_meta delete failure");
+      }
+      return super.delete(ident, type, cascade);
     }
   }
 
@@ -1041,5 +1055,28 @@ public class TestIcebergManagedCatalogOperations {
             .getDeclaredMethod("getSessionCount");
     method.setAccessible(true);
     return (int) method.invoke(null);
+  }
+
+  @Test
+  public void testDropRollsTheIcebergRowBackWhenTheEntityDeleteFails() throws Exception {
+    IcebergManagedCatalogOperations ops = newOps();
+    NameIdentifier ident = tableIdent("t_drop_atomic");
+    ops.createTable(ident, columns(), "spike", Collections.emptyMap(), new Transform[0]);
+    assertEquals(1L, countIcebergRows("t_drop_atomic"));
+
+    store.failTableDeletes(true);
+    try {
+      assertThrows(RuntimeException.class, () -> ops.dropTable(ident));
+    } finally {
+      store.failTableDeletes(false);
+    }
+
+    // Atomicity: the entity delete failure must roll the iceberg_tables row deletion back.
+    assertEquals(
+        1L, countIcebergRows("t_drop_atomic"), "the iceberg_tables row was not rolled back");
+    assertNotNull(store.get(ident, Entity.EntityType.TABLE, TableEntity.class));
+
+    assertTrue(ops.dropTable(ident));
+    assertEquals(0L, countIcebergRows("t_drop_atomic"));
   }
 }

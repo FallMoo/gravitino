@@ -24,6 +24,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -937,11 +938,18 @@ public class IcebergManagedCatalogOperations extends ManagedTableOperations
       }
     }
 
+    // The pointer row and the entity are deleted in the same transaction: a failure while dropping
+    // the entity must roll the row deletion back, otherwise the table reappears as a stale row
+    // (design doc sections 5.7 and 5.8.4).
+    AtomicBoolean entityDeleted = new AtomicBoolean(false);
     int deleted =
         runWriteOrFail(
-            connection -> metadataStore.deleteTable(connection, tableNamespace, ident.name()));
-    boolean entityDeleted = dropEntityQuietly(ident);
-    return deleted > 0 || entityDeleted;
+            connection -> {
+              int rows = metadataStore.deleteTable(connection, tableNamespace, ident.name());
+              entityDeleted.set(dropEntityQuietly(ident));
+              return rows;
+            });
+    return deleted > 0 || entityDeleted.get();
   }
 
   private void updateTableEntity(
