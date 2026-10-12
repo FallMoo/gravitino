@@ -33,6 +33,7 @@ import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.ServiceUnavailableException;
 import org.apache.iceberg.rest.requests.CreateNamespaceRequest;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
 import org.apache.iceberg.rest.requests.RegisterTableRequest;
@@ -135,8 +136,14 @@ public class ManagedCatalogWrapperForREST extends CatalogWrapperForREST {
   @Override
   public LoadTableResponse createTable(
       Namespace namespace, CreateTableRequest request, boolean requestCredential) {
-    // Managed catalogs do not vend credentials: Gravitino is the only writer of the metadata.
-    return createTable(namespace, request);
+    LoadTableResponse response = createTable(namespace, request);
+    // Credential vending is driven by the catalog configuration, not by who owns the metadata, so
+    // it works the same way as in federated mode (design doc section 5.9).
+    return injectCredentialIfRequested(
+        TableIdentifier.of(namespace, request.name()),
+        response,
+        CredentialPrivilege.WRITE,
+        requestCredential);
   }
 
   @Override
@@ -147,7 +154,8 @@ public class ManagedCatalogWrapperForREST extends CatalogWrapperForREST {
   @Override
   public LoadTableResponse loadTable(
       TableIdentifier identifier, boolean requestCredential, CredentialPrivilege privilege) {
-    return loadTable(identifier);
+    return injectCredentialIfRequested(
+        identifier, loadTable(identifier), privilege, requestCredential);
   }
 
   @Override
@@ -158,7 +166,12 @@ public class ManagedCatalogWrapperForREST extends CatalogWrapperForREST {
   @Override
   public LoadTableResponse registerTable(
       Namespace namespace, RegisterTableRequest request, boolean requestCredential) {
-    return registerTable(namespace, request);
+    LoadTableResponse response = registerTable(namespace, request);
+    return injectCredentialIfRequested(
+        TableIdentifier.of(namespace, request.name()),
+        response,
+        CredentialPrivilege.WRITE,
+        requestCredential);
   }
 
   @Override
@@ -205,8 +218,26 @@ public class ManagedCatalogWrapperForREST extends CatalogWrapperForREST {
   @Override
   public LoadCredentialsResponse getTableCredentials(
       TableIdentifier identifier, CredentialPrivilege privilege) {
-    // Managed catalogs store no JDBC/S3 credentials to hand out; clients keep using their own.
-    return ImmutableLoadCredentialsResponse.builder().build();
+    try {
+      // The base implementation loads the table through the Iceberg SDK catalog; managed mode has
+      // none, so it reads the metadata through the implementation layer instead.
+      return buildCredentialsResponse(
+          identifier, managedOps().loadTable(identifier).tableMetadata(), privilege);
+    } catch (ServiceUnavailableException e) {
+      LOG.warn("Service unavailable when loading table credentials for table: {}", identifier, e);
+      return ImmutableLoadCredentialsResponse.builder().build();
+    }
+  }
+
+  private LoadTableResponse injectCredentialIfRequested(
+      TableIdentifier identifier,
+      LoadTableResponse response,
+      CredentialPrivilege privilege,
+      boolean requestCredential) {
+    if (!shouldGenerateCredential(response, requestCredential)) {
+      return response;
+    }
+    return injectCredentialConfig(identifier, response, privilege);
   }
 
   @Override

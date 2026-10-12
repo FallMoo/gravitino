@@ -164,19 +164,32 @@ public class CatalogWrapperForREST extends IcebergCatalogWrapper {
       TableIdentifier identifier, CredentialPrivilege privilege) {
     try {
       LoadTableResponse loadTableResponse = super.loadTable(identifier);
-      Credential credential = getCredential(loadTableResponse.tableMetadata(), privilege);
-      return ImmutableLoadCredentialsResponse.builder()
-          .addCredentials(
-              IcebergRESTUtils.toRESTCredential(
-                  catalogCredentialManager.catalogName(),
-                  identifier,
-                  credential,
-                  loadTableResponse.tableMetadata()))
-          .build();
+      return buildCredentialsResponse(identifier, loadTableResponse.tableMetadata(), privilege);
     } catch (ServiceUnavailableException e) {
       LOG.warn("Service unavailable when loading table credentials for table: {}", identifier, e);
       return ImmutableLoadCredentialsResponse.builder().build();
     }
+  }
+
+  /**
+   * Builds the credential response for a table whose metadata the caller already holds. The Iceberg
+   * SDK catalog is deliberately not involved, so a wrapper without one (managed mode) can vend
+   * credentials too.
+   *
+   * @param identifier the table identifier
+   * @param tableMetadata the metadata carrying the locations the credential is scoped to
+   * @param privilege whether the client needs read or write credentials
+   * @return the credential response
+   * @throws ServiceUnavailableException if no credential can be generated for the locations
+   */
+  protected LoadCredentialsResponse buildCredentialsResponse(
+      TableIdentifier identifier, TableMetadata tableMetadata, CredentialPrivilege privilege) {
+    Credential credential = getCredential(tableMetadata, privilege);
+    return ImmutableLoadCredentialsResponse.builder()
+        .addCredentials(
+            IcebergRESTUtils.toRESTCredential(
+                catalogCredentialManager.catalogName(), identifier, credential, tableMetadata))
+        .build();
   }
 
   @Override

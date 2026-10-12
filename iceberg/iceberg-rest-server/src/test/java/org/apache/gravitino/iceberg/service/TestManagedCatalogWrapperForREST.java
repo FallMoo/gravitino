@@ -31,8 +31,11 @@ import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableMap;
 import java.util.Optional;
+import org.apache.commons.lang3.reflect.FieldUtils;
 import org.apache.gravitino.catalog.lakehouse.iceberg.IcebergConstants;
+import org.apache.gravitino.credential.CatalogCredentialManager;
 import org.apache.gravitino.credential.CredentialPrivilege;
+import org.apache.gravitino.credential.S3TokenCredential;
 import org.apache.gravitino.iceberg.common.IcebergConfig;
 import org.apache.gravitino.iceberg.common.ops.ManagedIcebergCatalogOps;
 import org.apache.iceberg.catalog.Namespace;
@@ -177,15 +180,112 @@ public class TestManagedCatalogWrapperForREST {
   }
 
   @Test
-  public void testViewsAreNotSupportedAndCredentialsAreEmpty() {
+  public void testViewsAreNotSupported() {
     ManagedCatalogWrapperForREST wrapper = wrapperFor(mock(ManagedIcebergCatalogOps.class));
     assertFalse(wrapper.supportsViewOperations());
-    assertTrue(
-        wrapper
-            .getTableCredentials(
-                TableIdentifier.of(Namespace.of("db"), "t1"), CredentialPrivilege.READ)
-            .credentials()
-            .isEmpty());
     assertEquals(CATALOG_NAME, wrapper.catalogName());
+  }
+
+  private static org.apache.iceberg.Schema testSchema() {
+    return new org.apache.iceberg.Schema(
+        org.apache.iceberg.types.Types.NestedField.required(
+            1, "id", org.apache.iceberg.types.Types.IntegerType.get()));
+  }
+
+  private static org.apache.iceberg.TableMetadata metadataAt(String location) {
+    return org.apache.iceberg.TableMetadata.newTableMetadata(
+        testSchema(),
+        org.apache.iceberg.PartitionSpec.unpartitioned(),
+        org.apache.iceberg.SortOrder.unsorted(),
+        location,
+        java.util.Map.of());
+  }
+
+  private static ManagedCatalogWrapperForREST credentialWrapperFor(
+      ManagedIcebergCatalogOps ops, CatalogCredentialManager manager) throws Exception {
+    ManagedCatalogWrapperForREST wrapper = wrapperFor(ops);
+    // The base constructor builds the manager from the catalog configuration; swap in a stub.
+    FieldUtils.writeField(wrapper, "catalogCredentialManager", manager, true);
+    return wrapper;
+  }
+
+  private static CatalogCredentialManager credentialManager() {
+    CatalogCredentialManager manager = mock(CatalogCredentialManager.class);
+    when(manager.catalogName()).thenReturn(CATALOG_NAME);
+    when(manager.getCredentialByPath(any(), any()))
+        .thenReturn(Optional.of(new S3TokenCredential("ak", "sk", "st", 99L)));
+    return manager;
+  }
+
+  @Test
+  public void testCredentialVendingIsDrivenByTheCatalogConfiguration() throws Exception {
+    ManagedIcebergCatalogOps ops = mock(ManagedIcebergCatalogOps.class);
+    ManagedCatalogWrapperForREST wrapper = credentialWrapperFor(ops, credentialManager());
+    Namespace namespace = Namespace.of("db");
+    TableIdentifier remote = TableIdentifier.of(namespace, "t_remote");
+    TableIdentifier local = TableIdentifier.of(namespace, "t_local");
+
+    when(ops.loadTable(remote))
+        .thenReturn(
+            LoadTableResponse.builder()
+                .withTableMetadata(metadataAt("s3://bucket/t_remote"))
+                .build());
+    when(ops.loadTable(local))
+        .thenReturn(
+            LoadTableResponse.builder()
+                .withTableMetadata(metadataAt("file:///tmp/t_local"))
+                .build());
+
+    // Requested and located on an object store: vended both as a REST credential and in the config.
+    LoadTableResponse vended = wrapper.loadTable(remote, true, CredentialPrivilege.READ);
+    assertFalse(vended.credentials().isEmpty(), "a requested credential must be vended");
+    assertEquals("ak", vended.config().get("s3.access-key-id"));
+    assertEquals("s3://bucket/t_remote", vended.credentials().get(0).prefix());
+
+    // Not requested, or a local/HDFS location: nothing is vended.
+    assertEquals(
+        0, wrapper.loadTable(remote, false, CredentialPrivilege.READ).credentials().size());
+    assertEquals(
+        0,
+        wrapper.loadTable(local, true, CredentialPrivilege.READ).credentials().size(),
+        "local locations must not vend credentials");
+
+    // The /credentials endpoint goes through the managed metadata, not through an SDK catalog.
+    assertFalse(
+        wrapper.getTableCredentials(remote, CredentialPrivilege.READ).credentials().isEmpty());
+  }
+
+  @Test
+  public void testCreateAndRegisterVendWriteCredentials() throws Exception {
+    ManagedIcebergCatalogOps ops = mock(ManagedIcebergCatalogOps.class);
+    ManagedCatalogWrapperForREST wrapper = credentialWrapperFor(ops, credentialManager());
+    Namespace namespace = Namespace.of("db");
+
+    CreateTableRequest createRequest =
+        CreateTableRequest.builder()
+            .withName("t_new")
+            .withSchema(testSchema())
+            .withPartitionSpec(org.apache.iceberg.PartitionSpec.unpartitioned())
+            .withWriteOrder(org.apache.iceberg.SortOrder.unsorted())
+            .withLocation("s3://bucket/t_new")
+            .setProperties(new java.util.HashMap<>())
+            .build();
+    when(ops.createTable(eq(namespace), any()))
+        .thenReturn(
+            LoadTableResponse.builder().withTableMetadata(metadataAt("s3://bucket/t_new")).build());
+
+    assertFalse(wrapper.createTable(namespace, createRequest, true).credentials().isEmpty());
+    assertEquals(0, wrapper.createTable(namespace, createRequest, false).credentials().size());
+
+    org.apache.iceberg.rest.requests.RegisterTableRequest registerRequest =
+        org.apache.iceberg.rest.requests.ImmutableRegisterTableRequest.builder()
+            .name("t_reg")
+            .metadataLocation("s3://bucket/t_reg/metadata/00000-x.metadata.json")
+            .build();
+    when(ops.registerTable(eq(namespace), any()))
+        .thenReturn(
+            LoadTableResponse.builder().withTableMetadata(metadataAt("s3://bucket/t_reg")).build());
+
+    assertFalse(wrapper.registerTable(namespace, registerRequest, true).credentials().isEmpty());
   }
 }
